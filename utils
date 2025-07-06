@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Global configuration variables
+# These can be overridden by setting them in your shell environment
+: "${LMSCLOUD_IMAGE:=ghcr.io/lmscloudpauld/lmscloud-koha-aarch64:22.11.15}"  # LMSCloud docker image
+: "${COMPOSE_LMSCLOUD:=docker-compose-lmscloud.yml}"  # Main docker-compose file
+: "${COMPOSE_PLAPI:=docker-compose.koha-public-library-api.yml}"  # Public Library API docker-compose file
+: "${VENDOR:=lmscloud}"  # Vendor/project name
+
+# GIT WORKTREES
+
+# gwts: Fuzzy-select and cd into a git worktree directory.
+# Usage: gwts
+# Requires: fzf, git
+# If not in a git repo, prints an error.
+gwts() {
+  # Check if inside a Git repository
+  if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    echo "Error: Not in a Git repository." >&2
+    return 1
+  fi
+
+  # Select worktree path using fzf
+  local dir
+  dir=$(git worktree list | fzf | awk '{ print $1 }')
+  if [[ -n $dir ]]; then
+    cd "$dir" || echo "Failed to change directory to $dir"
+  else
+    echo "No worktree selected."
+  fi
+}
+
+# GIT RELEASE MAINTENANCE HELPERS
+
+# gcrm: Create and switch to a new rmaint bug branch from the current rmaint branch.
+# Usage: gcrm <bug_number>
+# Only works on branches matching N.N.x (e.g., 25.05.x).
+# The new branch will be named N.N.bug_<bug_number>.
+gcrm() {
+    if [[ -z "$1" ]]; then
+        echo "Usage: gcrm <commit_number, e.g. 12345 for Bug 12345>" >&2
+        return 1
+    fi
+
+    local branchname
+    branchname="$(git rev-parse --abbrev-ref HEAD)"
+    if [[ ! "$branchname" =~ [0-9]+\.[0-9]+\.x ]]; then
+        echo "Error: '$branchname' is not an rmaint branch (expected format: N.N.x, e.g., 25.05.x)" >&2
+        return 1
+    fi
+
+    local branchnumber
+    local new_branch_name
+    branchnumber=$(echo "$branchname" | gsed 's/\.x$//')
+    new_branch_name="${branchnumber}bug_$1"
+
+    echo "Current branch: $branchname"
+    echo "Base branch number: $branchnumber"
+    echo "Creating new branch: $new_branch_name"
+
+    if ! git checkout "$branchname" -b "$new_branch_name"; then
+        echo "Error: Failed to create or switch to branch '$new_branch_name'." >&2
+        return 1
+    fi
+
+    echo "Successfully created and switched to branch '$new_branch_name'."
+    return 0
+}
+
+# gcorm: Switch to the current rmaint bug branch (N.N.xbug_NNNNN).
+# Usage: gcorm
+# Only works on bug branches matching N.N.xbug_NNNNN.
+gcorm() {
+    local branchname
+    branchname="$(git rev-parse --abbrev-ref HEAD)"
+    if [[ ! "$branchname" =~ [0-9]+\.[0-9]+\.xbug_[0-9]+ ]]; then
+        echo "Error: '$branchname' is not an rmaint bug (expected format: N.N.xbug_NNNNN, e.g., 25.05.xbug_12345)" >&2
+        return 1
+    fi
+
+    if ! git checkout "$branchname"; then
+        echo "Error: Failed to switch to branch '$branchname'." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# gmffrm: Fast-forward merge the current rmaint bug branch into the base rmaint branch.
+# Usage: gmffrm <bug_number>
+# Only works on branches matching N.N.x (e.g., 25.05.x).
+gmffrm() {
+    if [[ -z "$1" ]]; then
+        echo "Usage: gmffrm <commit_number, e.g. 12345 for Bug 12345>" >&2
+        return 1
+    fi
+
+    local branchname
+    branchname="$(git rev-parse --abbrev-ref HEAD)"
+    if [[ ! "$branchname" =~ [0-9]+\.[0-9]+\.x ]]; then
+        echo "Error: '$branchname' is not an rmaint branch (expected format: N.N.x, e.g., 25.05.x)" >&2
+        return 1
+    fi
+
+    local branchnumber
+    local new_branch_name
+    branchnumber=$(echo "$branchname" | gsed 's/\.x$//')
+    new_branch_name="${branchnumber}bug_$1"
+
+    echo "Current branch: $branchname"
+    echo "Base branch number: $branchnumber"
+    echo "Creating new branch: $new_branch_name"
+
+    if ! git merge "$new_branch_name" --ff-only; then
+        echo "Error: Failed to merge branch '$new_branch_name'." >&2
+        return 1
+    fi
+
+    echo "Successfully merged branch '$new_branch_name'."
+    return 0
+}
+
+# get_unique_bugs: Extract unique bug numbers from commit messages on stdin.
+# Usage: git log --oneline | get_unique_bugs
+# Requires: rg, sd
+get_unique_bugs() {
+  # rg: Find all occurrences (-o) matching the pattern across all input lines.
+  # Pattern: '[Bb]ug' matches 'Bug' or 'bug'.
+  #          '(?:[ _]*)?' optionally matches zero or more spaces or underscores
+  #                       (non-capturing group ?:). The final ? makes the group optional.
+  #          '[0-9]+' matches one or more digits (the bug number).
+  # sd: Replaces the matched prefix ('Bug'/'bug' potentially followed by _ or space)
+  #     with an empty string, leaving only the number.
+  # sort -u: Sorts the resulting numbers numerically and keeps only unique entries.
+  rg -o '[Bb]ug(?:[ _]*)?[0-9]+' | sd '[Bb]ug(?:[ _]*)?' '' | sort -nu
+}
+
+# DOCKER HELPERS
+
+# lmsd: Run Koha docker-compose commands in the $KTD_HOME directory.
+# Usage: lmsd <docker-compose-args>
+# Requires: ktd, docker-compose, $KTD_HOME env var
+lmsd() {
+    local action
+    local current_dir
+    action=("$@")
+    current_dir="$(pwd)"
+    if [[ -z "${action[*]}" ]]; then
+        return 1
+    fi
+
+    cd "$KTD_HOME" || return 1
+
+    LMSCLOUD_IMAGE="$LMSCLOUD_IMAGE" \
+    ktd --proxy \
+      -f "$COMPOSE_LMSCLOUD" \
+      -f "$COMPOSE_PLAPI" \
+      -p "$VENDOR" "${action[@]}"
+    echo "
+    LMSCLOUD_IMAGE=\"$LMSCLOUD_IMAGE\" \
+    ktd --proxy \
+      -f \"$COMPOSE_LMSCLOUD\" \
+      -f \"$COMPOSE_PLAPI\" \
+      -p \"$VENDOR\" \"\${action[@]}\""
+
+    cd "$current_dir" || return 1
+}
+
+# dtk: Run ktd with a given variant and action, optionally switching worktree if $ASK is set.
+# Usage: dtk <variant> <action>
+# Requires: ktd, docker, gwts (if $ASK is set)
+dtk() {
+    local variant
+    local action
+    local current_dir
+    variant=$1
+    action=$2
+    current_dir=$(pwd)
+    if [[ -z "$action" ]]; then
+        return 1
+    fi
+
+    if [[ -n "$ASK" ]]; then
+        local repo
+        repo=$(gwts)
+        cd "$repo" || return 1
+    fi
+
+    docker ps | grep -q proxy-proxy-1 || return 1
+
+    SYNC_REPO=$(pwd) ktd --proxy --name "$variant" "$action"
+}
+
+# dtka: Like dtk, but always prompts for worktree selection.
+# Usage: dtka <variant> <action>
+dtka() {
+    ASK=1 dtk "$1" "$2"
+}
+
+# kdp: Start and follow logs for a named docker environment.
+# Usage: kdp <alias>
+# Requires: ktd, docker
+kdp() {
+    local alias="$1"
+    if [[ -z "$alias" ]]; then
+        return 1
+    fi
+
+    SYNC_REPO=$(pwd) ktd --proxy --name "$alias" up -d && ktd --name "$alias" logs -f
+}
+
