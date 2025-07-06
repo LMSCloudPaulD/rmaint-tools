@@ -60,7 +60,6 @@ You can set these in your shell configuration file before sourcing the script:
 
 ```bash
 export LMSCLOUD_IMAGE="your-custom-lmscloud-image:tag"
-export VENDOR="your-project-name"
 ```
 
 ## Requirements
@@ -68,7 +67,7 @@ export VENDOR="your-project-name"
 - [fzf](https://github.com/junegunn/fzf) (for `gwts`)
 - [git](https://git-scm.com/)
 - [docker](https://www.docker.com/)
-- [ktd](https://github.com/lmscloudpauld/ktd) (for Koha docker helpers)
+- [ktd](https://gitlab.com/koha-community/koha-testing-docker) (for Koha docker helpers)
 - [rg (ripgrep)](https://github.com/BurntSushi/ripgrep) and [sd](https://github.com/chmln/sd) (for `get_unique_bugs`)
 
 ## License
