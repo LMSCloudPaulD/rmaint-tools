@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+
+# bzq: Fetch and display Koha Bugzilla issues with caching
+# Usage: bzq <bug_number>
+# Requires: curl, jq, skate (optional, for caching)
+# Environment variables:
+#   KOHABUGZILLA_API_BASE: Koha Bugzilla API base URL (default: https://bugs.koha-community.org/bugzilla3)
+#   BZQ_CACHE_TTL: Cache TTL in seconds (default: 300)
+
+# Environment variables with defaults
+: "${KOHABUGZILLA_API_BASE:=https://bugs.koha-community.org/bugzilla3}"  # Koha Bugzilla API base URL
+: "${BZQ_CACHE_TTL:=300}"  # Cache TTL in seconds (5 minutes default)
+
+# Cache helper functions
+function cache_get() {
+  local cache_key="$1"
+  if command -v skate >/dev/null 2>&1; then
+    skate get "$cache_key" 2>/dev/null
+  fi
+}
+
+function cache_set() {
+  local cache_key="$1"
+  local data="$2"
+  if command -v skate >/dev/null 2>&1 && [[ -n "$data" ]]; then
+    skate set "$cache_key" "$data" >/dev/null 2>&1
+  fi
+}
+
+function cache_remove() {
+  local cache_key="$1"
+  if command -v skate >/dev/null 2>&1; then
+    skate rm "$cache_key" >/dev/null 2>&1
+  fi
+}
+
+function cache_is_valid() {
+  local cached_data="$1"
+  local cache_ttl="$2"
+
+  if [[ -z "$cached_data" ]]; then
+    return 1
+  fi
+
+  # Check if it's valid JSON
+  if ! echo "$cached_data" | jq -e . >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local timestamp
+  timestamp=$(echo "$cached_data" | jq -r '.timestamp')
+  local current_time
+  current_time=$(date +%s)
+  local age=$((current_time - timestamp))
+
+  if [[ $age -lt $cache_ttl ]]; then
+    # Output the data field
+    echo "$cached_data" | jq -r '.data'
+    return 0
+  fi
+
+  return 1
+}
+
+# Comment handling function
+function process_comments() {
+  local bug_number="$1"
+  local comments_response="$2"
+
+  if [[ -z "$comments_response" ]] || echo "$comments_response" | jq -e '.error' >/dev/null 2>&1; then
+    echo "No comments found or unable to retrieve comments."
+    return
+  fi
+
+  echo "### Description and Comments"
+  echo ""
+
+  # Process directly with jq - this is robust and standard
+  local formatted_comments
+  formatted_comments=$(
+    echo "$comments_response" | jq -r --arg bug_id "$bug_number" '
+      .bugs?[$bug_id]?.comments[]? |
+      "#### Comment #" + (.id | tostring) + " by " + .creator + " on " + .creation_time + "\n\n" +
+      .text + "\n"
+    '
+  )
+
+  if [[ -n "$formatted_comments" ]]; then
+    echo "$formatted_comments"
+  else
+    echo "No comments to display."
+  fi
+}
+
+function bzq() {
+  if [[ -z "$1" ]]; then
+    echo "Usage: bzq <bug_number>"
+    return 1
+  fi
+
+  local bug_number="$1"
+  local cache_key="koha:bug:${bug_number}"
+
+  # Check cache first
+  local cached_data
+  cached_data=$(cache_get "$cache_key")
+  if [[ -n "$cached_data" ]]; then
+    local cached_output
+    cached_output=$(cache_is_valid "$cached_data" "$BZQ_CACHE_TTL")
+    # We need to check the exit status of the cache_is_valid function not its return value
+    # shellcheck disable=SC2181
+    if [[ $? -eq 0 ]]; then
+      echo "[Serving from cache]"
+      echo "$cached_output"
+      return 0
+    else
+      # Cache expired or invalid, remove it
+      cache_remove "$cache_key"
+    fi
+  fi
+
+  echo "[Fetching Koha Bugzilla issue ${bug_number} from API]"
+
+  # Generate and display the output
+  local output
+  output=$(bzq_output "$bug_number")
+  echo "$output"
+
+  # Cache the result using JSON format
+  if [[ -n "$output" ]]; then
+    local cache_data
+    local current_timestamp
+    current_timestamp=$(date +%s)
+    cache_data=$(jq -c -n --arg output "$output" --arg timestamp "$current_timestamp" '{timestamp: ($timestamp | tonumber), data: $output}')
+    cache_set "$cache_key" "$cache_data"
+  fi
+}
+
+function bzq_output() {
+  local bug_number="$1"
+
+  # Be specific about the fields we need - this is faster for the API
+  local fields=(
+    id summary status resolution product component assigned_to creator
+    creation_time last_change_time severity priority version platform op_sys
+    keywords whiteboard
+  )
+  local included_fields
+  included_fields=$(IFS=,; echo "${fields[*]}")
+  local koha_bugzilla_api_url="${KOHABUGZILLA_API_BASE}/rest/bug/${bug_number}?include_fields=${included_fields}"
+
+  # Fetch the JSON data from the API
+  local json_response
+  json_response=$(curl -s "${koha_bugzilla_api_url}")
+
+  if [[ -z "$json_response" ]]; then
+    echo "Error: Could not retrieve data for bug ${bug_number}. Check the number and API endpoint."
+    return 1
+  fi
+
+  # Check if the response contains an error
+  if echo "$json_response" | jq -e '.error' >/dev/null 2>&1; then
+    echo "Error: Bug ${bug_number} not found or access denied."
+    return 1
+  fi
+
+  # Use a single jq call to extract all data into an associative array
+  declare -A bug_data
+  while IFS='=' read -r key value; do
+    [[ -n "$key" ]] && bug_data["$key"]="$value"
+  done < <(echo "$json_response" | jq -r '
+      .bugs[0] |
+      "id=\(.id)",
+      "summary=\(.summary)",
+      "status=\(.status)",
+      "resolution=\(.resolution // "N/A")",
+      "product=\(.product)",
+      "component=\(.component)",
+      "assigned_to=\(.assigned_to)",
+      "creator=\(.creator)",
+      "creation_time=\(.creation_time)",
+      "last_change_time=\(.last_change_time)",
+      "severity=\(.severity)",
+      "priority=\(.priority)",
+      "version=\(.version)",
+      "platform=\(.platform)",
+      "op_sys=\(.op_sys)",
+      "keywords=\(.keywords | join(", "))",
+      "whiteboard=\(.whiteboard)"
+    ')
+
+  # Format dates
+  local creation_date
+  creation_date=$(date -d "${bug_data[creation_time]}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "${bug_data[creation_time]}")
+
+  local last_modified_date
+  last_modified_date=$(date -d "${bug_data[last_change_time]}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "${bug_data[last_change_time]}")
+
+  # --- Render to Markdown ---
+  echo "## Bug ${bug_data[id]}: ${bug_data[summary]}"
+  echo ""
+  echo "- **Product:** ${bug_data[product]}"
+  echo "- **Component:** ${bug_data[component]}"
+  echo "- **Status:** ${bug_data[status]}"
+  if [[ "${bug_data[resolution]}" != "N/A" ]]; then
+    echo "- **Resolution:** ${bug_data[resolution]}"
+  fi
+  echo "- **Severity:** ${bug_data[severity]}"
+  echo "- **Priority:** ${bug_data[priority]}"
+  echo "- **Assigned To:** ${bug_data[assigned_to]}"
+  echo "- **Reported By:** ${bug_data[creator]}"
+  echo "- **Version:** ${bug_data[version]}"
+  echo "- **Platform:** ${bug_data[platform]}"
+  echo "- **OS:** ${bug_data[op_sys]}"
+  echo "- **Opened:** ${creation_date}"
+  echo "- **Last Modified:** ${last_modified_date}"
+  if [[ -n "${bug_data[keywords]}" ]]; then
+    echo "- **Keywords:** ${bug_data[keywords]}"
+  fi
+  if [[ -n "${bug_data[whiteboard]}" ]]; then
+    echo "- **Whiteboard:** ${bug_data[whiteboard]}"
+  fi
+  echo ""
+  echo "---"
+  echo ""
+
+  # Get comments using the comments API
+  local comments_url="${KOHABUGZILLA_API_BASE}/rest/bug/${bug_number}/comment"
+  local comments_response
+  comments_response=$(curl -s "${comments_url}")
+
+  # Process comments
+  process_comments "$bug_number" "$comments_response"
+}
+
+# Execute the main function with all arguments
+bzq "$@"
