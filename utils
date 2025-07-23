@@ -134,6 +134,19 @@ get_unique_bugs() {
   rg -o '[Bb]ug(?:[ _]*)?[0-9]+' | sd '[Bb]ug(?:[ _]*)?' '' | sort -nu
 }
 
+# get_bug_number: Function to extract Bug numbers from a Git commit hash.
+# Usage: get_bug_number <commit_hash>
+# Example: bzq $(get_bug_number <commit_hash>)
+# Requires: git, rg
+get_bug_number() {
+    if [ -z "$1" ]; then
+      echo "Error: Please provide a Git hash as an argument." >&2
+      return 1
+    fi
+    local hash="$1"
+    git show "$hash" | rg "Bug.(\d*)" --only-matching --replace '$1'
+}
+
 # DOCKER HELPERS
 
 # lmsd: Run Koha docker-compose commands in the $KTD_HOME directory.
