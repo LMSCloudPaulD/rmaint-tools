@@ -159,6 +159,26 @@ bzh() {
     bzq $(get_bug_number "$hash")
 }
 
+# rmaint_checklist: Generate a release maintainer checklist table for given release versions
+# Usage: rmaint_checklist <version1> <version2> [version3] ...
+# Example: rmaint_checklist 25.05 24.11 24.05 22.11
+rmaint_checklist() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: rmaint_checklist <version1> <version2> [version3] ..." >&2
+        echo "Example: rmaint_checklist 25.05 24.11 24.05 22.11" >&2
+        return 1
+    fi
+
+    # Print table header
+    echo "|         | DBRev | Release Notes | Tag |"
+    echo "|---------|-------|---------------|-----|"
+
+    # Print table rows for each version
+    for version in "$@"; do
+        echo "| ${version}.x |       |               |     |"
+    done
+}
+
 # DOCKER HELPERS
 
 # lmsd: Run Koha docker-compose commands in the $KTD_HOME directory.
