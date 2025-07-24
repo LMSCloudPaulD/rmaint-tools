@@ -147,6 +147,18 @@ get_bug_number() {
     git show "$hash" | rg "Bug.(\d*)" --only-matching --replace '$1'
 }
 
+# bzh: Function that's just a shorter form to query bz from a hash
+# Usage: bzh <commit_hash>
+# Requires: get_bug_number, bzq, git, rg
+bzh() {
+    if [ -z "$1" ]; then
+     echo "Error: Please provide a Git hash as an argument" >&2
+     return 1
+    fi
+    local hash="$1"
+    bzq $(get_bug_number "$hash")
+}
+
 # DOCKER HELPERS
 
 # lmsd: Run Koha docker-compose commands in the $KTD_HOME directory.
