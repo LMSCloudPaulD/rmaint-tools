@@ -66,6 +66,13 @@ The script automatically caches responses to reduce API calls and improve perfor
   - Displays bug details in markdown format with comments
   - Caches responses to reduce API calls
   - Configurable via environment variables
+- **git-bz-overlay**: Overlay Bugzilla metadata onto commits produced by `git log`.
+  - Usage: `./git-bz-overlay [options] [revisions...] [-- <extra git log args>...]`
+  - Request arbitrary Bugzilla fields (`--field`, `--fields`), customise output via templates (`--format`), guard large commit selections (`--max-commits`/`KOHA_BZ_MAX_COMMITS`), control retry/throttle behaviour (`--max-retries`, `--request-delay`), batch API calls (`--batch-size`/`KOHA_BZ_BATCH_SIZE`), and emit pipe-friendly rows with a custom delimiter (`--separator`/`KOHA_BZ_SEPARATOR`).
+  - Structured rows include: `commit_hash`, `commit_subject`, `bug_id`, `status`, `importance`, `assignee`, `qa_contact`, `depends_on`, `blocks`, `resolution`, `summary`, `bug_url`, `status_block`, `status_resolution`, and the rendered template output. A header row is emitted by default when a separator is used (disable with `--no-header`/`KOHA_BZ_HEADER=0`).
+  - Caches per-bug responses in `~/.cache/git-bz-overlay` by default (configurable via `--cache-*` flags or environment).
+- **git-rmaint**: Thin wrapper around `git-bz-overlay` that injects the canonical release-maintenance `git log --right-only --cherry-pick --no-merges` selection and defaults to tab-separated output (override via `KOHA_BZ_SEPARATOR`).
+- Manual pages for both scripts live under `man/` and can be viewed with `man -l man/git-bz-overlay.1` or `man -l man/git-rmaint.1`.
 
 ## Configuration
 
@@ -82,6 +89,16 @@ The scripts use several environment variables that can be customized:
 ### Bugzilla Configuration
 
 - `KOHABUGZILLA_API_BASE`: Koha Bugzilla API base URL (default: `https://bugs.koha-community.org/bugzilla3`)
+- `KOHA_BZ_BATCH_SIZE`: Number of bug IDs fetched per API request (default: `20`)
+- `KOHA_BZ_MAX_COMMITS`: Maximum commits before prompting for confirmation (default: `400`; `0` disables)
+- `KOHA_BZ_MAX_RETRIES`: Retry failed Bugzilla fetches this many times before giving up (default: `3`; `0` allows unlimited retries)
+- `KOHA_BZ_REQUEST_DELAY`: Seconds to wait between Bugzilla batch requests (default: `0.2`; set to `0` to disable throttling)
+- `KOHA_BZ_SEPARATOR`: When set, emit delimiter-separated rows (`commit_hash`, `commit_subject`, Bugzilla fields, rendered template) using the given separator (default: ` | `). Literal escape sequences like `\t` or `\n` are recognised.
+- `KOHA_BZ_HEADER`: Set to `false`/`0` to suppress the header row when using structured output (default: enabled)
+- `KOHA_BZ_ASSUME_YES`: Set to `true`/`1` to continue automatically when limits are exceeded
+- `KOHA_BZ_PROGRESS`: Set to `false`/`0` to suppress progress messages (enabled by default)
+- `KOHA_BZ_CACHE_DIR`: Cache directory for `git-bz-overlay` (default: `~/.cache/git-bz-overlay`)
+- `KOHA_BZ_CACHE_TTL`: Cache duration in seconds for `git-bz-overlay` (default: `300`; `<=0` disables cache)
 - `BZQ_CACHE_TTL`: Cache TTL in seconds for bzq (default: `300`)
 
 You can set these in your shell configuration file before sourcing the script:

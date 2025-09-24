@@ -1,0 +1,36 @@
+.TH GIT-RMAINT 1 "2024-06-05" "git-rmaint" "User Commands"
+.SH NAME
+git-rmaint \- convenience wrapper around git-bz-overlay for Koha release maintenance
+.SH SYNOPSIS
+.B git-rmaint
+\fIrev-range\fR
+[\fB--\fR \fIextra git log args\fR]
+.SH DESCRIPTION
+.B git-rmaint
+delegates to
+.BR git-bz-overlay (1)
+from the same directory after prepending the canonical Koha release
+maintenance filters
+.RB ( "git log --right-only --cherry-pick --no-merges --oneline" ).
+It defaults to tab-separated output by exporting
+.B KOHA_BZ_SEPARATOR=\t
+before invoking
+.BR git-bz-overlay ,
+making the result easier to post-process. Set
+.B KOHA_BZ_SEPARATOR
+yourself to override the delimiter. Additional
+.BR git-log (1)
+arguments may be appended by passing them after a literal
+.B --
+on the command line.
+.SH OPTIONS
+Options are forwarded verbatim to
+.BR git-bz-overlay (1)
+after the default
+.BR git-log (1)
+flags are inserted.
+Run
+.B git-bz-overlay --help
+for the full list.
+.SH SEE ALSO
+.BR git-bz-overlay (1)

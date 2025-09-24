@@ -1,0 +1,179 @@
+.TH GIT-BZ-OVERLAY 1 "2024-06-05" "git-bz-overlay" "User Commands"
+.SH NAME
+git-bz-overlay \- overlay Koha Bugzilla metadata on commits in a revision range
+.SH SYNOPSIS
+.B git-bz-overlay
+\fIOPTIONS\fR
+[\fIrevisions\fR ...]
+[\fB--\fR \fIextra git log args\fR]
+.SH DESCRIPTION
+.B git-bz-overlay
+runs \fBgit log --oneline\fR (plus any user supplied arguments and
+revisions), extracts Koha bug numbers from the commit subjects, and
+augments each line with metadata fetched from the Bugzilla REST API. Bug
+identifiers are discovered using the \fBBug 12345\fR naming convention.
+Results can be scripted further by requesting specific Bugzilla fields or
+rendering through custom output templates.
+.SH OPTIONS
+.TP
+.BR -f , " --format " \fITEMPLATE\fR
+Render overlay entries using a custom template. Placeholders such as
+\fB{{field}}\fR are substituted with the corresponding Bugzilla or
+derived field value. Unknown placeholders are replaced by the empty
+string. The default template is:
+.RS
+.nf
+Bug {{id}}: {{status_block}} {{summary}}
+.fi
+.RE
+.TP
+.BR -F , " --field " \fIFIELD\fR
+Request an additional Bugzilla field. Repeat the flag to request more
+than one field.
+.TP
+.B --fields \fILIST\fR
+Comma-separated list of extra Bugzilla fields to request.
+.TP
+.B --no-common-fields
+Do not implicitly include the built-in common Bugzilla field set.
+.TP
+.B --list-common-fields
+Print the names of the common Bugzilla fields and exit.
+.TP
+.B --batch-size \fIN\fR
+Override the Bugzilla request batch size. Defaults to the value of
+\fBKOHA_BZ_BATCH_SIZE\fR or \fB20\fR.
+.TP
+.B --base-url \fIURL\fR
+Use an alternate Bugzilla instance. Defaults to the value of
+\fBKOHABUGZILLA_API_BASE\fR or the Koha community Bugzilla.
+.TP
+.B --cache-dir \fIPATH\fR
+Store and read cached Bugzilla responses from \fIPATH\fR. Defaults to
+\fB~/.cache/git-bz-overlay\fR when caching is enabled.
+.TP
+.B --cache-ttl \fISECONDS\fR
+Set the cache duration in seconds. Defaults to \fBKOHA_BZ_CACHE_TTL\fR or
+\fB300\fR. Values less than or equal to zero disable caching.
+.TP
+.B --no-cache
+Disable caching entirely for this invocation.
+.TP
+.B --max-commits \fIN\fR
+Prompt for confirmation when more than \fIN\fR commits are selected. Defaults
+to \fBKOHA_BZ_MAX_COMMITS\fR or \fB400\fR. Set to \fB0\fR to disable the
+limit.
+.TP
+.B --max-retries \fIN\fR
+Retry failed Bugzilla requests up to \fIN\fR times. Defaults to
+\fBKOHA_BZ_MAX_RETRIES\fR or \fB3\fR. Set to \fB0\fR for unlimited retries.
+.TP
+.BR -y , " --yes , --assume-yes"
+Proceed automatically when limits are exceeded (suppresses the confirmation
+prompt).
+.TP
+.B --progress
+Enable per-batch progress messages (default).
+.TP
+.B --no-progress
+Disable progress messages.
+.TP
+.B --separator \fISEP\fR
+When provided, output one row per bug with fields separated by \fISEP\fR
+(commit hash, commit subject, bug id, status, importance, assignee, QA contact,
+depends_on, blocks, resolution, summary, bug URL, status block,
+status/resolution text, and the rendered template). Defaults to
+\fBKOHA_BZ_SEPARATOR\fR or \fB" | "\fR. Without this flag, a human-readable
+summary is emitted.
+.TP
+.B --header
+Enable the header row for structured output (default).
+.TP
+.B --no-header
+Suppress the header row for structured output.
+.TP
+.B --request-delay \fISECONDS\fR
+Wait at least \fISECONDS\fR between Bugzilla batch requests. Defaults to
+\fBKOHA_BZ_REQUEST_DELAY\fR or \fB0.2\fR seconds.
+.TP
+.B --no-throttle
+Disable the inter-request delay (equivalent to \fB--request-delay 0\fR).
+.TP
+.BR -h , " --help"
+Show a help message and exit.
+.TP
+.B --
+Treat the remaining arguments as raw options to be passed straight to
+\fBgit log\fR.
+.SH ENVIRONMENT
+.TP
+.B KOHABUGZILLA_API_BASE
+Default Bugzilla base URL.
+.TP
+.B KOHA_BZ_BATCH_SIZE
+Number of bug identifiers fetched per API request.
+.TP
+.B KOHA_BZ_CACHE_DIR
+Directory used to store per-bug cache files.
+.TP
+.B KOHA_BZ_CACHE_TTL
+Cache lifetime in seconds. Values \fB\<= 0\fR disable caching.
+.TP
+.B KOHA_BZ_REQUEST_DELAY
+Seconds to wait between Bugzilla batch requests (default 0.2).
+.TP
+.B KOHA_BZ_MAX_COMMITS
+Maximum commits allowed before prompting (default 400; 0 disables the limit).
+.TP
+.B KOHA_BZ_MAX_RETRIES
+Retry limit per bug for failed Bugzilla requests (default 3; 0 allows unlimited
+retries).
+.TP
+.B KOHA_BZ_SEPARATOR
+Separator used for structured output rows (default " | "). Literal escape
+sequences such as \fB\t\fR or \fB\n\fR are recognised.
+.TP
+.B KOHA_BZ_HEADER
+Controls whether a header row is printed when emitting structured output
+(default enabled).
+.TP
+.B KOHA_BZ_ASSUME_YES
+Set to a truthy value to continue automatically when the commit limit is
+exceeded.
+.TP
+.B KOHA_BZ_PROGRESS
+Default progress preference (truthy values enable progress output).
+.SH DERIVED FIELDS
+The following template placeholders are derived by the tool and do not
+need to be requested explicitly: \fBbug_url\fR, \fBstatus_block\fR,
+\fBstatus_resolution\fR, \fBresolution_suffix\fR, \fBcommit\fR,
+\fBcommit_hash\fR, \fBcommit_subject\fR.
+.SH EXAMPLES
+.TP
+.B git-bz-overlay 25.05.x...upstream/main
+Show outstanding commits on \fBupstream/main\fR relative to
+\fB25.05.x\fR.
+.TP
+.B git-bz-overlay HEAD~20..HEAD
+Review the last twenty commits on the current branch.
+.TP
+.B git-bz-overlay --format '{{id}}\t{{status}}\t{{commit_hash}}' main
+Render a tab-separated overlay listing bug identifier, status, and commit hash
+for a linear branch history.
+.TP
+.B git-bz-overlay --separator "\t" 25.05.x...upstream/main
+Emit one tab-separated row per bug, suitable for piping into tools like
+\fBcut\fR or \fBmlr\fR.
+.TP
+.B git-bz-overlay -- --since=2024-01-01 --author='Jane Doe'
+Let \fBgit log\fR determine the revision set (here, commits since the start
+of 2024 authored by Jane Doe) and overlay Bugzilla metadata.
+.SH FILES
+.TP
+.B ~/.cache/git-bz-overlay
+Default cache directory for Bugzilla responses (one JSON file per bug).
+.SH SEE ALSO
+.BR git-rmaint (1),
+.BR git-log (1)
+.SH AUTHOR
+Paul Derscheid and contributors

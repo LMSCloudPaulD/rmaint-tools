@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: git-rmaint <rev-range> [-- <extra git log args>...]
+
+Delegate to the reusable git-bz-overlay helper using the canonical Koha
+maintenance diff (git log --right-only --cherry-pick --no-merges --oneline)
+to list commits that still need backporting for the given range.
+
+Examples:
+  git-rmaint 25.05.x...upstream/main
+  git-rmaint 24.11.x...origin/main -- --since="2024-01-01"
+USAGE
+}
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+overlay_script="${script_dir}/git-bz-overlay"
+
+if [[ ! -x "$overlay_script" ]]; then
+  echo "Error: git-bz-overlay helper not found or not executable at '$overlay_script'." >&2
+  exit 1
+fi
+
+rev_range=$1
+shift || true
+
+declare -a user_git_args=()
+if [[ $# -gt 0 ]]; then
+  if [[ $1 == "--" ]]; then
+    shift || true
+  fi
+  if [[ $# -gt 0 ]]; then
+    user_git_args=("$@")
+  fi
+fi
+
+if [[ -z "${KOHA_BZ_SEPARATOR:-}" ]]; then
+  export KOHA_BZ_SEPARATOR='\t'
+fi
+
+if [[ ${#user_git_args[@]} -gt 0 ]]; then
+  exec "$overlay_script" "$rev_range" -- --right-only --cherry-pick --no-merges "${user_git_args[@]}"
+else
+  exec "$overlay_script" "$rev_range" -- --right-only --cherry-pick --no-merges
+fi
