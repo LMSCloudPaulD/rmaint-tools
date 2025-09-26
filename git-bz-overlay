@@ -1,21 +1,77 @@
 #!/usr/bin/env perl
+
 use strict;
 use warnings;
-use Getopt::Long qw(:config no_ignore_case bundling);
-use JSON::PP;
+
+use Carp       qw(croak carp);
+use English    qw(-no_match_vars);
+use File::Path qw(make_path);
 use File::Spec;
-use File::Path   qw(make_path);
-use Time::HiRes  qw(time);
-use Scalar::Util qw(looks_like_number);
+use Getopt::Long qw(GetOptionsFromArray);
 use IPC::Open3;
-use Symbol qw(gensym);
+use JSON::PP;
+use Scalar::Util qw(looks_like_number);
+use Symbol       qw(gensym);
+use Time::HiRes  qw(time);
 
-my $DEFAULT_TEMPLATE =
-    'Bug {{id}}: {{status_block}}{{importance_block}} {{summary}} | Assignee: {{assigned_to}} | QA: {{qa_contact}} | Depends: {{depends_on}} | Blocks: {{blocks}}';
-my $JSON_UTF8           = JSON::PP->new->utf8;
-my $JSON_UTF8_CANONICAL = JSON::PP->new->utf8->canonical;
+our $VERSION = '1.0.0';
 
-my @common_bug_fields = qw(
+my $NOT_FOUND         = -1;
+my $EXIT_STATUS_SHIFT = 8;
+my $STAT_MTIME_INDEX  = 9;
+my $PERCENTAGE_BASE   = 100;
+
+my $DEFAULT_TEMPLATE
+    = 'Bug {{id}}: {{status_block}}{{importance_block}} {{summary}} | Assignee: {{assigned_to}} | QA: {{qa_contact}} | Depends: {{depends_on}} | Blocks: {{blocks}}';
+my $DEFAULT_SEPARATOR          = ' | ';
+my $JOINED_OVERLAY_SEPARATOR   = '; ';
+my $COMMIT_SEPARATOR           = '  |  ';
+my $CACHE_HITS_MESSAGE         = 'cache hits';
+my $FETCHED_MESSAGE            = 'fetched %d';
+my $COMPLETE_MESSAGE           = 'complete';
+my $FAILURES_MESSAGE           = ' with %d failure%s';
+my $WARNING_FAILED_BATCH       = "Warning: Failed to fetch Bugzilla data for batch [%s]: %s\n";
+my $WARNING_PARSE_ERROR        = "Warning: Could not parse Bugzilla response for batch [%s]\n";
+my $WARNING_NO_DATA            = "Warning: No Bugzilla data returned for bug %s (%s)\n";
+my $ERROR_MAX_COMMITS          = "Error: max-commits must be numeric\n";
+my $ERROR_MAX_RETRIES          = "Error: max-retries must be numeric\n";
+my $ERROR_NEGATIVE_MAX_COMMITS = "Error: max-commits cannot be negative\n";
+my $ERROR_NEGATIVE_MAX_RETRIES = "Error: max-retries cannot be negative\n";
+my $ERROR_BATCH_SIZE           = "Error: batch-size must be a positive integer\n";
+my $ERROR_REQUEST_DELAY        = "Error: request-delay must be a non-negative number\n";
+my $ERROR_NO_FIELDS            = "Error: No Bugzilla fields selected. Use --field or --fields to specify at least one.\n";
+my $ERROR_CURL_NOT_FOUND       = "Error: curl is required for Bugzilla requests but was not found in PATH\n";
+my $ERROR_GIT_NOT_FOUND        = "Error: required command '%s' not found in PATH\n";
+my $NOTICE_PROCESSING_COMMITS  = "Notice: processing %d commits (limit %d) due to --yes/assume-yes option.\n";
+my $PROMPT_CONTINUE            = 'About to process %d commits referencing up to %d bug(s). Continue? [y/N] ';
+my $ABORTED_MESSAGE            = "Aborted by user.\n";
+my $MISSING_SUMMARY            = '(summary unavailable)';
+my $BUG_URL_TEMPLATE           = '%s/show_bug.cgi?id=%s';
+my $DEFAULT_BASE_URL           = 'https://bugs.koha-community.org/bugzilla3';
+my $WAITPID_ERROR              = -1;
+my $TSV_HEADER
+    = "commit_hash\tcommit_subject\tbug_id\tstatus\timportance\tassignee\tqa_contact\tdepends_on\tblocks\tresolution\tsummary\tbug_url\tstatus_block\tstatus_resolution\toverlay\n";
+my $JSON_FILE_EXTENSION       = '.json';
+my $CACHE_DIR_NAME            = '.cache/git-bz-overlay';
+my $HOME_ENV                  = 'HOME';
+my $KOHA_BZ_BATCH_SIZE_ENV    = 'KOHA_BZ_BATCH_SIZE';
+my $KOHABUGZILLA_API_BASE_ENV = 'KOHABUGZILLA_API_BASE';
+my $KOHA_BZ_CACHE_DIR_ENV     = 'KOHA_BZ_CACHE_DIR';
+my $KOHA_BZ_CACHE_TTL_ENV     = 'KOHA_BZ_CACHE_TTL';
+my $KOHA_BZ_REQUEST_DELAY_ENV = 'KOHA_BZ_REQUEST_DELAY';
+my $KOHA_BZ_MAX_COMMITS_ENV   = 'KOHA_BZ_MAX_COMMITS';
+my $KOHA_BZ_MAX_RETRIES_ENV   = 'KOHA_BZ_MAX_RETRIES';
+my $KOHA_BZ_ASSUME_YES_ENV    = 'KOHA_BZ_ASSUME_YES';
+my $KOHA_BZ_PROGRESS_ENV      = 'KOHA_BZ_PROGRESS';
+my $KOHA_BZ_HEADER_ENV        = 'KOHA_BZ_HEADER';
+my $KOHA_BZ_SEPARATOR_ENV     = 'KOHA_BZ_SEPARATOR';
+my $DEFAULT_BATCH_SIZE        = 20;
+my $DEFAULT_CACHE_TTL         = 300;
+my $DEFAULT_RETRY_DELAY       = 0.2;
+my $DEFAULT_TIMEOUT           = 400;
+my $DEFAULT_MAX_RETRIES       = 3;
+
+my @COMMON_BUG_FIELDS = qw(
     status
     resolution
     summary
@@ -27,7 +83,7 @@ my @common_bug_fields = qw(
     blocks
 );
 
-my %derived_fields = (
+my %DERIVED_FIELDS = (
     bug_url           => 1,
     status_block      => 1,
     status_resolution => 1,
@@ -39,400 +95,740 @@ my %derived_fields = (
     commit_subject    => 1,
 );
 
-my $format_template;
-my @extra_fields;
-my $list_common_fields;
-my $show_help;
-my $no_common_fields;
-my $batch_size    = $ENV{KOHA_BZ_BATCH_SIZE}    // 20;
-my $base_url      = $ENV{KOHABUGZILLA_API_BASE} // 'https://bugs.koha-community.org/bugzilla3';
-my $cache_dir     = $ENV{KOHA_BZ_CACHE_DIR};
-my $cache_ttl     = defined $ENV{KOHA_BZ_CACHE_TTL} ? $ENV{KOHA_BZ_CACHE_TTL} : 300;
-my $cache_enabled = 1;
-my $request_delay = defined $ENV{KOHA_BZ_REQUEST_DELAY} ? $ENV{KOHA_BZ_REQUEST_DELAY} : 0.2;
-my $max_commits =
-    defined $ENV{KOHA_BZ_MAX_COMMITS} && $ENV{KOHA_BZ_MAX_COMMITS} ne ''
-    ? $ENV{KOHA_BZ_MAX_COMMITS}
-    : 400;
-my $max_retries =
-    defined $ENV{KOHA_BZ_MAX_RETRIES} && $ENV{KOHA_BZ_MAX_RETRIES} ne ''
-    ? $ENV{KOHA_BZ_MAX_RETRIES}
-    : 3;
-my $assume_yes       = parse_bool( $ENV{KOHA_BZ_ASSUME_YES}, 0 );
-my $progress_env_set = defined $ENV{KOHA_BZ_PROGRESS} ? 1 : 0;
-my $show_progress    = parse_bool( $ENV{KOHA_BZ_PROGRESS}, 1 );
-my $show_header      = parse_bool( $ENV{KOHA_BZ_HEADER},   1 );
-my $separator        = defined $ENV{KOHA_BZ_SEPARATOR} ? $ENV{KOHA_BZ_SEPARATOR} : ' | ';
+my @STRUCTURED_HEADER_FIELDS = qw(
+    commit_hash
+    commit_subject
+    bug_id
+    status
+    importance
+    assignee
+    qa_contact
+    depends_on
+    blocks
+    resolution
+    summary
+    bug_url
+    status_block
+    status_resolution
+    overlay
+);
 
-GetOptions(
-    'format|f=s'         => \$format_template,
-    'field|F=s@'         => \@extra_fields,
-    'fields=s'           => sub { my @f = split /,/, $_[1]; push @extra_fields, @f; },
-    'list-common-fields' => \$list_common_fields,
-    'no-common-fields'   => \$no_common_fields,
-    'batch-size=i'       => \$batch_size,
-    'base-url=s'         => \$base_url,
-    'cache-dir=s'        => \$cache_dir,
-    'cache-ttl=i'        => \$cache_ttl,
-    'no-cache'           => sub { $cache_enabled = 0; },
-    'request-delay=f'    => \$request_delay,
-    'no-throttle'        => sub { $request_delay = 0; },
-    'max-commits=i'      => \$max_commits,
-    'max-retries=i'      => \$max_retries,
-    'y|yes|assume-yes'   => \$assume_yes,
-    'progress!'          => \$show_progress,
-    'header!'            => \$show_header,
-    'separator=s'        => sub {
-        my ( $opt_name, $opt_value ) = @_;
-        $separator = $opt_value;
-    },
-    'help|h' => \$show_help,
-) or die usage();
+my $JSON_UTF8           = JSON::PP->new->utf8;
+my $JSON_UTF8_CANONICAL = JSON::PP->new->utf8->canonical;
 
-if ($show_help) {
-    print usage();
-    exit 0;
-}
+Getopt::Long::Configure(qw(no_ignore_case bundling));
 
-if ($list_common_fields) {
-    print join( "\n", @common_bug_fields ), "\n";
-    exit 0;
-}
-
-$assume_yes    = $assume_yes    ? 1 : 0;
-$show_progress = $show_progress ? 1 : 0;
-if ( !$progress_env_set && !-t STDERR ) {
-    $show_progress = 0;
-}
-$show_header = $show_header ? 1 : 0;
-
-if ( defined $max_commits && $max_commits ne '' ) {
-    die "Error: max-commits must be numeric\n" unless looks_like_number($max_commits);
-    $max_commits = int($max_commits);
-    if ( $max_commits < 0 ) {
-        die "Error: max-commits cannot be negative\n";
-    }
-}
-
-if ( defined $max_retries && $max_retries ne '' ) {
-    die "Error: max-retries must be numeric\n" unless looks_like_number($max_retries);
-    $max_retries = int($max_retries);
-    if ( $max_retries < 0 ) {
-        die "Error: max-retries cannot be negative\n";
-    }
-}
-
-$separator = defined $separator ? $separator : ' | ';
-if ( $separator eq '\\t' ) {
-    $separator = "\t";
-}
-elsif ( $separator eq '\\n' ) {
-    $separator = "\n";
-}
-elsif ( $separator eq '\\r' ) {
-    $separator = "\r";
-}
-
-my $structured_output = ( $separator ne ' | ' );
-
-if ( !defined $cache_dir || $cache_dir eq '' ) {
-    my $home = $ENV{HOME} || '.';
-    $cache_dir = File::Spec->catdir( $home, '.cache', 'git-bz-overlay' );
-}
-
-if ( $cache_ttl <= 0 ) {
-    $cache_enabled = 0;
-}
-
-if ( $batch_size !~ /^[1-9][0-9]*$/ ) {
-    die "Error: batch-size must be a positive integer\n";
-}
-
-if ( !defined $request_delay || !looks_like_number($request_delay) || $request_delay < 0 ) {
-    die "Error: request-delay must be a non-negative number\n";
-}
-
-$format_template //= $DEFAULT_TEMPLATE;
-
-my @template_fields = collect_fields_from_template($format_template);
-
-my @requested_fields;
-my %seen_fields;
+sub main;
+sub parse_cli_arguments;
+sub adjust_progress_mode;
+sub fetch_commit_lines;
+sub build_commit_context;
+sub commit_limit_allows;
+sub hydrate_bug_data;
+sub report_missing_bug_data;
+sub emit_output;
 
 sub add_field {
-    my ($field) = @_;
-    return if !defined $field || $field eq '';
-    return if $derived_fields{$field};
-    return if $seen_fields{$field};
-    push @requested_fields, $field;
-    $seen_fields{$field} = 1;
+    my ( $field, $requested_ref, $seen_ref ) = @_;
+    return if !defined $field || $field eq q{};
+    return if $DERIVED_FIELDS{$field};
+    return if $seen_ref->{$field};
+
+    push @{$requested_ref}, $field;
+    $seen_ref->{$field} = 1;
+
+    return;
 }
 
-add_field('id');
+sub main {
+    my $state = parse_cli_arguments(@ARGV);
 
-if ( !$no_common_fields ) {
-    add_field($_) for @common_bug_fields;
+    if ( $state->{show_help} ) {
+        print usage() or croak $OS_ERROR;
+        return 0;
+    }
+
+    if ( $state->{list_common_fields} ) {
+        print join( "\n", @COMMON_BUG_FIELDS ), "\n" or croak $OS_ERROR;
+        return 0;
+    }
+
+    adjust_progress_mode($state);
+
+    ensure_commands('git');
+
+    my @commit_lines = fetch_commit_lines($state);
+    return 0 if !@commit_lines;
+
+    my $commit_context = build_commit_context( \@commit_lines );
+
+    if ( !$commit_context->{bug_count} ) {
+        print join( "\n", @commit_lines ), "\n" or croak $OS_ERROR;
+        return 0;
+    }
+
+    if ( !commit_limit_allows( $state, $commit_context ) ) {
+        return 1;
+    }
+
+    my ( $cache_reader, $cache_writer )
+        = cache_helpers( $state->{cache_dir}, $state->{cache_ttl}, $state->{cache_enabled}, $state->{requested_fields} );
+
+    my $bug_state = hydrate_bug_data( $state, $commit_context->{ordered_ids}, $cache_reader, $cache_writer );
+
+    report_missing_bug_data( $commit_context->{ordered_ids}, $bug_state->{bug_data}, $bug_state->{failed} );
+
+    emit_output( $state, \@commit_lines, $commit_context->{commit_to_ids}, $bug_state->{bug_data} );
+
+    return scalar keys %{ $bug_state->{failed} } ? 1 : 0;
 }
 
-add_field($_) for map {s/^\s+|\s+$//gr} @extra_fields;
-add_field($_) for @template_fields;
+sub parse_cli_arguments {
+    my (@argv) = @_;
 
-if ( !@requested_fields ) {
-    die "Error: No Bugzilla fields selected. Use --field or --fields to specify at least one.\n";
+    my $state = defaults_from_env();
+
+    my @args = @argv;
+    apply_cli_options( \@args, $state );
+
+    normalize_boolean_flags($state);
+    validate_numeric_limits($state);
+    normalize_separator_setting($state);
+    finalize_cache_settings($state);
+    validate_batch_settings($state);
+    finalize_template_state($state);
+
+    my ( $revision_args, $git_extra_args ) = split_revision_arguments(@args);
+    $state->{revision_args}  = $revision_args;
+    $state->{git_extra_args} = $git_extra_args;
+
+    return $state;
 }
 
-my @revision_args;
-my @git_extra_args;
-if (@ARGV) {
-    my $separator_index = -1;
-    for my $i ( 0 .. $#ARGV ) {
-        if ( $ARGV[$i] eq '--' ) {
+sub defaults_from_env {
+    my $assume_yes    = parse_bool( $ENV{$KOHA_BZ_ASSUME_YES_ENV}, 0 );
+    my $progress_flag = defined $ENV{$KOHA_BZ_PROGRESS_ENV} ? 1 : 0;
+    my $show_progress = parse_bool( $ENV{$KOHA_BZ_PROGRESS_ENV}, 1 );
+    my $show_header   = parse_bool( $ENV{$KOHA_BZ_HEADER_ENV},   1 );
+
+    return {
+        format_template    => undef,
+        extra_fields       => [],
+        list_common_fields => 0,
+        no_common_fields   => 0,
+        show_help          => 0,
+        batch_size         => $ENV{$KOHA_BZ_BATCH_SIZE_ENV}    // $DEFAULT_BATCH_SIZE,
+        base_url           => $ENV{$KOHABUGZILLA_API_BASE_ENV} // $DEFAULT_BASE_URL,
+        cache_dir     => $ENV{$KOHA_BZ_CACHE_DIR_ENV},
+        cache_ttl     => defined $ENV{$KOHA_BZ_CACHE_TTL_ENV} ? $ENV{$KOHA_BZ_CACHE_TTL_ENV} : $DEFAULT_CACHE_TTL,
+        cache_enabled => 1,
+        request_delay => defined $ENV{$KOHA_BZ_REQUEST_DELAY_ENV} ? $ENV{$KOHA_BZ_REQUEST_DELAY_ENV} : $DEFAULT_RETRY_DELAY,
+        max_commits   => defined $ENV{$KOHA_BZ_MAX_COMMITS_ENV}
+            && $ENV{$KOHA_BZ_MAX_COMMITS_ENV} ne q{} ? $ENV{$KOHA_BZ_MAX_COMMITS_ENV}
+        : $DEFAULT_TIMEOUT,
+        max_retries => defined $ENV{$KOHA_BZ_MAX_RETRIES_ENV}
+            && $ENV{$KOHA_BZ_MAX_RETRIES_ENV} ne q{} ? $ENV{$KOHA_BZ_MAX_RETRIES_ENV}
+        : $DEFAULT_MAX_RETRIES,
+        assume_yes       => $assume_yes,
+        progress_env_set => $progress_flag,
+        show_progress    => $show_progress,
+        show_header      => $show_header,
+        separator        => defined $ENV{$KOHA_BZ_SEPARATOR_ENV} ? $ENV{$KOHA_BZ_SEPARATOR_ENV} : $DEFAULT_SEPARATOR,
+    };
+}
+
+sub apply_cli_options {
+    my ( $args_ref, $state ) = @_;
+
+    my $extra_fields_ref = $state->{extra_fields};
+
+    GetOptionsFromArray(
+        $args_ref,
+        'format|f=s'         => \( $state->{format_template} ),
+        'field|F=s@'         => $extra_fields_ref,
+        'fields=s'           => sub { push @{$extra_fields_ref}, split /,/smx, $_[1]; },
+        'list-common-fields' => \( $state->{list_common_fields} ),
+        'no-common-fields'   => \( $state->{no_common_fields} ),
+        'batch-size=i'       => \( $state->{batch_size} ),
+        'base-url=s'         => \( $state->{base_url} ),
+        'cache-dir=s'        => \( $state->{cache_dir} ),
+        'cache-ttl=i'        => \( $state->{cache_ttl} ),
+        'no-cache'           => sub { $state->{cache_enabled} = 0; },
+        'request-delay=f'    => \( $state->{request_delay} ),
+        'no-throttle'        => sub { $state->{request_delay} = 0; },
+        'max-commits=i'      => \( $state->{max_commits} ),
+        'max-retries=i'      => \( $state->{max_retries} ),
+        'y|yes|assume-yes!'  => \( $state->{assume_yes} ),
+        'progress!'          => \( $state->{show_progress} ),
+        'header!'            => \( $state->{show_header} ),
+        'separator=s'        => \( $state->{separator} ),
+        'help|h'             => \( $state->{show_help} ),
+    ) or croak usage();
+
+    return;
+}
+
+sub normalize_boolean_flags {
+    my ($state) = @_;
+    $state->{assume_yes}         = $state->{assume_yes}         ? 1 : 0;
+    $state->{show_progress}      = $state->{show_progress}      ? 1 : 0;
+    $state->{show_header}        = $state->{show_header}        ? 1 : 0;
+    $state->{list_common_fields} = $state->{list_common_fields} ? 1 : 0;
+    $state->{no_common_fields}   = $state->{no_common_fields}   ? 1 : 0;
+    $state->{show_help}          = $state->{show_help}          ? 1 : 0;
+    return;
+}
+
+sub validate_numeric_limits {
+    my ($state) = @_;
+    validate_limit( $state, 'max_commits', $ERROR_MAX_COMMITS, $ERROR_NEGATIVE_MAX_COMMITS );
+    validate_limit( $state, 'max_retries', $ERROR_MAX_RETRIES, $ERROR_NEGATIVE_MAX_RETRIES );
+    return;
+}
+
+sub validate_limit {
+    my ( $state, $key, $non_numeric_msg, $negative_msg ) = @_;
+    my $value = $state->{$key};
+    return                 if !defined $value || $value eq q{};
+    croak $non_numeric_msg if !looks_like_number($value);
+    $value = int $value;
+    croak $negative_msg if $value < 0;
+    $state->{$key} = $value;
+    return;
+}
+
+sub normalize_separator_setting {
+    my ($state) = @_;
+    $state->{separator}         = normalize_separator( $state->{separator} );
+    $state->{structured_output} = ( $state->{separator} ne $DEFAULT_SEPARATOR ) ? 1 : 0;
+    return;
+}
+
+sub finalize_cache_settings {
+    my ($state) = @_;
+    if ( !defined $state->{cache_dir} || $state->{cache_dir} eq q{} ) {
+        my $home = $ENV{$HOME_ENV} || q{.};
+        $state->{cache_dir} = File::Spec->catdir( $home, $CACHE_DIR_NAME );
+    }
+    if ( $state->{cache_ttl} <= 0 ) {
+        $state->{cache_enabled} = 0;
+    }
+    return;
+}
+
+sub validate_batch_settings {
+    my ($state) = @_;
+    croak $ERROR_BATCH_SIZE if $state->{batch_size} !~ /^[1-9]\d*$/smx;
+    my $delay = $state->{request_delay};
+    croak $ERROR_REQUEST_DELAY
+        if !defined $delay
+        || !looks_like_number($delay)
+        || $delay < 0;
+    return;
+}
+
+sub finalize_template_state {
+    my ($state) = @_;
+    $state->{format_template} //= $DEFAULT_TEMPLATE;
+    my $requested_fields
+        = build_requested_fields( $state->{format_template}, $state->{no_common_fields}, $state->{extra_fields} );
+    croak $ERROR_NO_FIELDS if !@{$requested_fields};
+    $state->{requested_fields} = $requested_fields;
+    return;
+}
+
+sub normalize_separator {
+    my ($separator) = @_;
+    $separator = defined $separator ? $separator : $DEFAULT_SEPARATOR;
+    return "\t" if $separator eq '\\t';
+    return "\n" if $separator eq '\\n';
+    return "\r" if $separator eq '\\r';
+    return $separator;
+}
+
+sub build_requested_fields {
+    my ( $format_template, $no_common_fields, $extra_fields_ref ) = @_;
+
+    my @requested_fields;
+    my %seen_fields;
+
+    add_field( 'id', \@requested_fields, \%seen_fields );
+
+    if ( !$no_common_fields ) {
+        for my $field (@COMMON_BUG_FIELDS) {
+            add_field( $field, \@requested_fields, \%seen_fields );
+        }
+    }
+
+    for my $field ( map { trim_whitespace($_) } @{ $extra_fields_ref || [] } ) {
+        add_field( $field, \@requested_fields, \%seen_fields );
+    }
+
+    for my $field ( collect_fields_from_template($format_template) ) {
+        add_field( $field, \@requested_fields, \%seen_fields );
+    }
+
+    return \@requested_fields;
+}
+
+sub trim_whitespace {
+    my ($value) = @_;
+    return q{} if !defined $value;
+    $value =~ s/^\s+|\s+$//smxg;
+    return $value;
+}
+
+sub split_revision_arguments {
+    my (@args) = @_;
+    my @revision_args;
+    my @git_extra_args;
+
+    return ( \@revision_args, \@git_extra_args ) if !@args;
+
+    my $separator_index = $NOT_FOUND;
+    for my $i ( 0 .. $#args ) {
+        if ( $args[$i] eq q{--} ) {
             $separator_index = $i;
             last;
         }
     }
+
     if ( $separator_index >= 0 ) {
-        @revision_args  = @ARGV[ 0 .. $separator_index - 1 ]      if $separator_index > 0;
-        @git_extra_args = @ARGV[ $separator_index + 1 .. $#ARGV ] if $separator_index < $#ARGV;
+        if ( $separator_index > 0 ) {
+            @revision_args = @args[ 0 .. $separator_index - 1 ];
+        }
+        if ( $separator_index < $#args ) {
+            @git_extra_args = @args[ $separator_index + 1 .. $#args ];
+        }
     }
     else {
-        @revision_args = @ARGV;
+        @revision_args = @args;
     }
+
+    return ( \@revision_args, \@git_extra_args );
 }
 
-ensure_commands(qw(git));
-my @http_required = qw();
-if ( !$cache_enabled ) {
-
-    # no-op
+sub adjust_progress_mode {
+    my ($state) = @_;
+    if ( !$state->{progress_env_set} && !-t *STDERR ) {
+        $state->{show_progress} = 0;
+    }
+    return;
 }
 
-my @git_args = ( 'log', '--oneline' );
-push @git_args, @git_extra_args if @git_extra_args;
-push @git_args, @revision_args  if @revision_args;
-
-my @commit_lines = run_git_log(@git_args);
-if ( !@commit_lines ) {
-    exit 0;
+sub fetch_commit_lines {
+    my ($state) = @_;
+    my @git_args = qw(log --oneline);
+    if ( @{ $state->{git_extra_args} } ) {
+        push @git_args, @{ $state->{git_extra_args} };
+    }
+    if ( @{ $state->{revision_args} } ) {
+        push @git_args, @{ $state->{revision_args} };
+    }
+    return run_git_log(@git_args);
 }
 
-my ( $ordered_ids_ref, $ids_by_commit_ref ) = extract_bug_ids(@commit_lines);
-my @ordered_ids   = @$ordered_ids_ref;
-my %commit_to_ids = %$ids_by_commit_ref;
-
-my $commit_count = scalar @commit_lines;
-my $bug_count    = scalar @ordered_ids;
-
-if ( defined $max_commits && $max_commits > 0 && $commit_count > $max_commits ) {
-    if ($assume_yes) {
-        warn sprintf "Notice: processing %d commits (limit %d) due to --yes/assume-yes option.\n", $commit_count, $max_commits;
-    }
-    else {
-        my $prompt = sprintf( "About to process %d commits referencing up to %d bug(s). Continue? [y/N] ", $commit_count, $bug_count );
-        unless ( prompt_for_confirmation($prompt) ) {
-            warn "Aborted by user.\n";
-            exit 1;
-        }
-    }
+sub build_commit_context {
+    my ($commit_lines_ref) = @_;
+    my ( $ordered_ids_ref, $ids_by_commit_ref ) = extract_bug_ids( @{$commit_lines_ref} );
+    return {
+        ordered_ids   => $ordered_ids_ref,
+        commit_to_ids => $ids_by_commit_ref,
+        commit_count  => scalar @{$commit_lines_ref},
+        bug_count     => scalar @{$ordered_ids_ref},
+    };
 }
 
-if ( !@ordered_ids ) {
-    print join( "\n", @commit_lines ), "\n";
-    exit 0;
+sub commit_limit_allows {
+    my ( $state, $context ) = @_;
+    my $limit = $state->{max_commits};
+    return 1 if !defined $limit || $limit <= 0;
+    return 1 if $context->{commit_count} <= $limit;
+
+    if ( $state->{assume_yes} ) {
+        carp sprintf $NOTICE_PROCESSING_COMMITS, $context->{commit_count}, $limit;
+        return 1;
+    }
+
+    my $prompt = sprintf $PROMPT_CONTINUE, $context->{commit_count}, $context->{bug_count};
+    return 1 if prompt_for_confirmation($prompt);
+
+    carp $ABORTED_MESSAGE;
+    return 0;
 }
 
-my ( $cache_reader, $cache_writer ) = cache_helpers( $cache_dir, $cache_ttl, $cache_enabled, \@requested_fields );
+sub hydrate_bug_data {
+    my ( $state, $ordered_ids_ref, $cache_reader, $cache_writer ) = @_;
 
-my %bug_data;
-my @needs_fetch;
-my $total_bugs     = $bug_count;
-my $processed_bugs = 0;
-my $cache_hits     = 0;
-my %fetch_attempts;
-my %failed_ids;
-for my $id (@ordered_ids) {
-    my $cached = $cache_reader->($id);
-    if ($cached) {
-        $bug_data{$id} = $cached;
-        $cache_hits++;
-        $processed_bugs++;
+    my $cache_state = build_cache_state( $ordered_ids_ref, $cache_reader );
+
+    maybe_report_cache_hits( $state, $cache_state );
+
+    if ( @{ $cache_state->{needs_fetch} } ) {
+        fetch_pending_batches( $state, $cache_state, $cache_writer );
     }
-    else {
-        push @needs_fetch, $id;
-    }
+
+    report_final_progress( $state, $cache_state );
+
+    return {
+        bug_data => $cache_state->{bug_data},
+        failed   => $cache_state->{failed_ids},
+    };
 }
 
-if ( $total_bugs > 0 && $cache_hits > 0 ) {
-    progress_report( $processed_bugs, $total_bugs, $cache_hits, 'cache hits' ) if $show_progress;
-}
+sub build_cache_state {
+    my ( $ordered_ids_ref, $cache_reader ) = @_;
 
-while (@needs_fetch) {
-    my @batch   = splice @needs_fetch, 0, $batch_size;
-    my $include = join( ',', @requested_fields );
-    my $url     = sprintf( '%s/rest/bug?id=%s&include_fields=%s', $base_url, join( ',', @batch ), $include );
-    my ( $ok, $body, $status_text ) = http_get($url);
-    if ( !$ok ) {
-        warn sprintf "Warning: Failed to fetch Bugzilla data for batch [%s]: %s\n", join( ',', @batch ), $status_text;
-        handle_failed_ids( \@batch, $status_text, \%fetch_attempts, \%failed_ids, \@needs_fetch, $max_retries );
-        if ( @needs_fetch && $request_delay > 0 ) {
-            select undef, undef, undef, $request_delay;
-        }
-        next;
-    }
-    my $data = eval { $JSON_UTF8->decode($body) };
-    if ( $@ || ref($data) ne 'HASH' ) {
-        warn sprintf "Warning: Could not parse Bugzilla response for batch [%s]\n", join( ',', @batch );
-        handle_failed_ids( \@batch, 'parse error', \%fetch_attempts, \%failed_ids, \@needs_fetch, $max_retries );
-        if ( @needs_fetch && $request_delay > 0 ) {
-            select undef, undef, undef, $request_delay;
-        }
-        next;
-    }
-    my $bugs        = $data->{bugs} || [];
-    my $new_records = 0;
-    my %returned_ids;
-    for my $bug (@$bugs) {
-        next if ref($bug) ne 'HASH';
-        my %record;
-        for my $field (@requested_fields) {
-            my $value = exists $bug->{$field} ? stringify_value( $bug->{$field} ) : '';
-            $record{$field} = $value;
-        }
-        if ( defined $record{id} ) {
-            my $id         = $record{id};
-            my $first_seen = !exists $bug_data{$id};
-            $bug_data{$id}     = \%record;
-            $returned_ids{$id} = 1;
-            if ($first_seen) {
-                $new_records++;
-            }
-            $cache_writer->( $id, \%record );
-        }
-    }
+    my %bug_data;
+    my @needs_fetch;
+    my %failed_ids;
+    my %fetch_attempts;
+    my $processed  = 0;
+    my $cache_hits = 0;
 
-    if ( $new_records > 0 ) {
-        $processed_bugs += $new_records;
-        progress_report( $processed_bugs, $total_bugs, $cache_hits, sprintf( 'fetched %d', $new_records ) ) if $show_progress;
-    }
-
-    my @missing = grep { !$returned_ids{$_} } @batch;
-    if (@missing) {
-        handle_failed_ids( \@missing, 'missing from response', \%fetch_attempts, \%failed_ids, \@needs_fetch, $max_retries );
-    }
-
-    if ( @needs_fetch && $request_delay > 0 ) {
-        select undef, undef, undef, $request_delay;
-    }
-}
-
-if ( $show_progress && $total_bugs > 0 ) {
-    my $final_note = 'complete';
-    if (%failed_ids) {
-        my $failed_count = scalar keys %failed_ids;
-        $final_note .= sprintf( ' with %d failure%s', $failed_count, $failed_count == 1 ? '' : 's' );
-    }
-    progress_report( $processed_bugs, $total_bugs, $cache_hits, $final_note );
-}
-
-for my $id (@ordered_ids) {
-    if ( !exists $bug_data{$id} ) {
-        my $reason = $failed_ids{$id} || 'Bugzilla returned no data';
-        warn sprintf "Warning: No Bugzilla data returned for bug %s (%s)\n", $id, $reason;
-    }
-}
-
-my @header_fields = (
-    'commit_hash', 'commit_subject', 'bug_id',  'status',  'importance',   'assignee',          'qa_contact', 'depends_on',
-    'blocks',      'resolution',     'summary', 'bug_url', 'status_block', 'status_resolution', 'overlay'
-);
-my @structured_rows;
-my @plain_rows;
-
-for my $commit (@commit_lines) {
-    my ( $hash, $subject ) = parse_commit_line($commit);
-    my @ids = @{ $commit_to_ids{$commit} || [] };
-
-    if ( !@ids ) {
-        if ($structured_output) {
-            push @structured_rows, [ $hash, $subject, ('') x ( scalar(@header_fields) - 2 ) ];
+    for my $id ( @{$ordered_ids_ref} ) {
+        my $cached = $cache_reader->($id);
+        if ($cached) {
+            $bug_data{$id} = $cached;
+            $cache_hits++;
+            $processed++;
         }
         else {
-            push @plain_rows, $commit;
+            push @needs_fetch, $id;
         }
-        next;
     }
 
-    my @overlays;
-    for my $id (@ids) {
-        my $record = $bug_data{$id} || { id => $id };
-        my %values = (
-            %$record,
-            bug_url           => sprintf( '%s/show_bug.cgi?id=%s', $base_url, $id ),
-            resolution_suffix => resolution_suffix( $record->{resolution} ),
-            status_resolution => status_resolution( $record->{status}, $record->{resolution} ),
-            status_block      => status_block( $record->{status}, $record->{resolution} ),
-            commit            => $commit,
-            commit_hash       => $hash,
-            commit_subject    => $subject,
-        );
-        my @importance_parts = grep { defined $_ && $_ ne '' } ( $values{priority}, $values{severity} );
-        my $importance       = join( '/', @importance_parts );
-        $values{importance}       = $importance;
-        $values{importance_block} = @importance_parts ? " ($importance)" : '';
-        for my $list_field (qw(depends_on blocks qa_contact)) {
-            if ( ref $values{$list_field} eq 'ARRAY' ) {
-                $values{$list_field} = join( ',', @{ $values{$list_field} } );
+    return {
+        bug_data       => \%bug_data,
+        needs_fetch    => \@needs_fetch,
+        failed_ids     => \%failed_ids,
+        fetch_attempts => \%fetch_attempts,
+        processed      => $processed,
+        cache_hits     => $cache_hits,
+        total_bugs     => scalar @{$ordered_ids_ref},
+    };
+}
+
+sub maybe_report_cache_hits {
+    my ( $state, $cache_state ) = @_;
+    return if !$state->{show_progress};
+    return if !$cache_state->{total_bugs};
+    return if !$cache_state->{cache_hits};
+
+    progress_report( $cache_state->{processed}, $cache_state->{total_bugs}, $cache_state->{cache_hits},
+        $CACHE_HITS_MESSAGE );
+    return;
+}
+
+sub report_final_progress {
+    my ( $state, $cache_state ) = @_;
+    return if !$state->{show_progress};
+    return if !$cache_state->{total_bugs};
+
+    my $note = $COMPLETE_MESSAGE;
+    if ( %{ $cache_state->{failed_ids} } ) {
+        my $failed_count = scalar keys %{ $cache_state->{failed_ids} };
+        $note .= sprintf $FAILURES_MESSAGE, $failed_count, $failed_count == 1 ? q{} : 's';
+    }
+
+    progress_report( $cache_state->{processed}, $cache_state->{total_bugs}, $cache_state->{cache_hits}, $note );
+    return;
+}
+
+sub fetch_pending_batches {
+    my ( $state, $cache_state, $cache_writer ) = @_;
+    my $fields_param = join q{,}, @{ $state->{requested_fields} };
+    my $queue_ref    = $cache_state->{needs_fetch};
+
+    while ( @{$queue_ref} ) {
+        my @batch = splice @{$queue_ref}, 0, $state->{batch_size};
+        my $url   = sprintf '%s/rest/bug?id=%s&include_fields=%s', $state->{base_url}, join( q{,}, @batch ), $fields_param;
+
+        my ( $ok, $body, $status_text ) = http_get($url);
+        if ( !$ok ) {
+            carp sprintf $WARNING_FAILED_BATCH, join( q{,}, @batch ), $status_text;
+            handle_failed_ids(
+                \@batch,
+                $status_text,
+                {   attempts    => $cache_state->{fetch_attempts},
+                    failed      => $cache_state->{failed_ids},
+                    queue       => $queue_ref,
+                    max_retries => $state->{max_retries},
+                }
+            );
+            throttle_between_batches( $state->{request_delay}, $queue_ref );
+            next;
+        }
+
+        my $data = eval { $JSON_UTF8->decode($body) };
+        if ( $EVAL_ERROR || ref($data) ne 'HASH' ) {
+            carp sprintf $WARNING_PARSE_ERROR, join q{,}, @batch;
+            handle_failed_ids(
+                \@batch,
+                'parse error',
+                {   attempts    => $cache_state->{fetch_attempts},
+                    failed      => $cache_state->{failed_ids},
+                    queue       => $queue_ref,
+                    max_retries => $state->{max_retries},
+                }
+            );
+            throttle_between_batches( $state->{request_delay}, $queue_ref );
+            next;
+        }
+
+        my ( $new_records, $returned_ids_ref )
+            = process_bug_batch( $data->{bugs} || [], $state->{requested_fields}, $cache_state->{bug_data}, $cache_writer );
+
+        if ( $new_records > 0 ) {
+            $cache_state->{processed} += $new_records;
+            if ( $state->{show_progress} ) {
+                progress_report(
+                    $cache_state->{processed}, $cache_state->{total_bugs}, $cache_state->{cache_hits},
+                    sprintf $FETCHED_MESSAGE,  $new_records
+                );
             }
         }
-        $values{summary} = '(summary unavailable)'
-            if !defined $values{summary} || $values{summary} eq '';
 
-        my $rendered = render_template( $format_template, \%values );
-        push @overlays, $rendered;
+        my @missing = grep { !$returned_ids_ref->{$_} } @batch;
+        if (@missing) {
+            handle_failed_ids(
+                \@missing,
+                'missing from response',
+                {   attempts    => $cache_state->{fetch_attempts},
+                    failed      => $cache_state->{failed_ids},
+                    queue       => $queue_ref,
+                    max_retries => $state->{max_retries},
+                }
+            );
+        }
 
-        if ($structured_output) {
-            push @structured_rows,
-                [
-                $hash,
-                $subject,
-                $values{id}                // '',
-                $values{status}            // '',
-                $values{importance}        // '',
-                $values{assigned_to}       // '',
-                $values{qa_contact}        // '',
-                $values{depends_on}        // '',
-                $values{blocks}            // '',
-                $values{resolution}        // '',
-                $values{summary}           // '',
-                $values{bug_url}           // '',
-                $values{status_block}      // '',
-                $values{status_resolution} // '',
-                $rendered,
-                ];
+        throttle_between_batches( $state->{request_delay}, $queue_ref );
+    }
+
+    return;
+}
+
+sub process_bug_batch {
+    my ( $bugs, $requested_fields, $bug_data_ref, $cache_writer ) = @_;
+
+    my $new_records = 0;
+    my %returned_ids;
+
+    for my $bug ( @{$bugs} ) {
+        next if ref $bug ne 'HASH';
+
+        my %bug_record;
+        for my $field ( @{$requested_fields} ) {
+            my $value = exists $bug->{$field} ? stringify_value( $bug->{$field} ) : q{};
+            $bug_record{$field} = $value;
+        }
+
+        next if !defined $bug_record{id};
+        my $bug_id     = $bug_record{id};
+        my $first_seen = !exists $bug_data_ref->{$bug_id};
+        $bug_data_ref->{$bug_id} = \%bug_record;
+        $cache_writer->( $bug_id, \%bug_record );
+        $returned_ids{$bug_id} = 1;
+        if ($first_seen) {
+            $new_records++;
         }
     }
 
-    next if $structured_output;
-
-    my $joined_overlays = join( '; ', @overlays );
-    push @plain_rows, $commit . '  |  ' . $joined_overlays;
+    return ( $new_records, \%returned_ids );
 }
 
-if ($structured_output) {
-    if ( $show_header && @structured_rows ) {
-        print join( $separator, map { escape_separator( $_, $separator ) } @header_fields ), "\n";
+sub throttle_between_batches {
+    my ( $delay, $queue_ref ) = @_;
+    return if $delay <= 0;
+    return if !$queue_ref || !@{$queue_ref};
+    Time::HiRes::sleep($delay);
+    return;
+}
+
+sub report_missing_bug_data {
+    my ( $ordered_ids_ref, $bug_data_ref, $failed_ref ) = @_;
+    for my $id ( @{$ordered_ids_ref} ) {
+        next if exists $bug_data_ref->{$id};
+        my $reason = $failed_ref->{$id} || 'Bugzilla returned no data';
+        carp sprintf $WARNING_NO_DATA, $id, $reason;
     }
-    for my $row (@structured_rows) {
-        print join( $separator, map { escape_separator( $_ // '', $separator ) } @$row ), "\n";
+    return;
+}
+
+sub emit_output {
+    my ( $state, $commit_lines_ref, $commit_to_ids_ref, $bug_data_ref ) = @_;
+
+    if ( $state->{structured_output} ) {
+        my @structured = build_structured_rows( $state, $commit_lines_ref, $commit_to_ids_ref, $bug_data_ref );
+        emit_structured_rows( $state, \@structured );
+        return;
     }
-    exit 0;
+
+    my @plain = build_plain_rows( $state, $commit_lines_ref, $commit_to_ids_ref, $bug_data_ref );
+    emit_plain_rows( \@plain );
+    return;
 }
 
-for my $line (@plain_rows) {
-    print $line, "\n";
+sub build_structured_rows {
+    my ( $state, $commit_lines_ref, $commit_to_ids_ref, $bug_data_ref ) = @_;
+    my @rows;
+
+    for my $commit ( @{$commit_lines_ref} ) {
+        my $ids_ref     = $commit_to_ids_ref->{$commit} || [];
+        my $commit_data = collect_commit_overlays( $state, $commit, $ids_ref, $bug_data_ref );
+
+        if ( !@{ $commit_data->{entries} } ) {
+            push @rows, default_structured_row( $commit_data->{hash}, $commit_data->{subject} );
+            next;
+        }
+
+        for my $entry ( @{ $commit_data->{entries} } ) {
+            push @rows, build_structured_row( $entry->{values}, $entry->{hash}, $entry->{subject}, $entry->{rendered} );
+        }
+    }
+
+    return @rows;
 }
 
-exit 0;
+sub build_plain_rows {
+    my ( $state, $commit_lines_ref, $commit_to_ids_ref, $bug_data_ref ) = @_;
+    my @rows;
+
+    for my $commit ( @{$commit_lines_ref} ) {
+        my $ids_ref     = $commit_to_ids_ref->{$commit} || [];
+        my $commit_data = collect_commit_overlays( $state, $commit, $ids_ref, $bug_data_ref );
+
+        if ( !@{ $commit_data->{entries} } ) {
+            push @rows, $commit;
+            next;
+        }
+
+        my @rendered = map { $_->{rendered} } @{ $commit_data->{entries} };
+        my $joined   = join $JOINED_OVERLAY_SEPARATOR, @rendered;
+        push @rows, $commit_data->{original} . $COMMIT_SEPARATOR . $joined;
+    }
+
+    return @rows;
+}
+
+sub collect_commit_overlays {
+    my ( $state, $commit, $ids_ref, $bug_data_ref ) = @_;
+
+    my ( $hash, $subject ) = parse_commit_line($commit);
+    my @entries;
+
+    for my $id ( @{$ids_ref} ) {
+        my $bug_record_ref = $bug_data_ref->{$id} || { id => $id };
+        my %values         = compose_overlay_values(
+            $bug_record_ref,
+            {   base_url => $state->{base_url},
+                commit   => $commit,
+                hash     => $hash,
+                subject  => $subject,
+            }
+        );
+        my $rendered = render_template( $state->{format_template}, \%values );
+        push @entries,
+            {
+            hash     => $hash,
+            subject  => $subject,
+            values   => \%values,
+            rendered => $rendered,
+            };
+    }
+
+    return {
+        hash     => $hash,
+        subject  => $subject,
+        entries  => \@entries,
+        original => $commit,
+    };
+}
+
+sub default_structured_row {
+    my ( $hash, $subject ) = @_;
+    my $blank_fields = ( scalar @STRUCTURED_HEADER_FIELDS ) - 2;
+    return [ $hash, $subject, (q{}) x $blank_fields ];
+}
+
+sub compose_overlay_values {
+    my ( $bug_record_ref, $context ) = @_;
+
+    my %values = %{$bug_record_ref};
+    my $id     = $values{id};
+
+    $values{bug_url}           = sprintf $BUG_URL_TEMPLATE, $context->{base_url}, $id;
+    $values{resolution_suffix} = resolution_suffix( $values{resolution} );
+    $values{status_resolution} = status_resolution( $values{status}, $values{resolution} );
+    $values{status_block}      = status_block( $values{status}, $values{resolution} );
+    $values{commit}            = $context->{commit};
+    $values{commit_hash}       = $context->{hash};
+    $values{commit_subject}    = $context->{subject};
+
+    my @importance_parts = grep { defined $_ && $_ ne q{} } ( $values{priority}, $values{severity} );
+    my $importance       = join q{/}, @importance_parts;
+    $values{importance}       = $importance;
+    $values{importance_block} = @importance_parts ? qq{ ($importance)} : q{};
+
+    for my $list_field (qw(depends_on blocks qa_contact)) {
+        if ( ref $values{$list_field} eq 'ARRAY' ) {
+            $values{$list_field} = join q{,}, @{ $values{$list_field} };
+        }
+    }
+
+    if ( !defined $values{summary} || $values{summary} eq q{} ) {
+        $values{summary} = $MISSING_SUMMARY;
+    }
+
+    return %values;
+}
+
+sub build_structured_row {
+    my ( $values_ref, $hash, $subject, $rendered ) = @_;
+    return [
+        $hash,
+        $subject,
+        $values_ref->{id}                // q{},
+        $values_ref->{status}            // q{},
+        $values_ref->{importance}        // q{},
+        $values_ref->{assigned_to}       // q{},
+        $values_ref->{qa_contact}        // q{},
+        $values_ref->{depends_on}        // q{},
+        $values_ref->{blocks}            // q{},
+        $values_ref->{resolution}        // q{},
+        $values_ref->{summary}           // q{},
+        $values_ref->{bug_url}           // q{},
+        $values_ref->{status_block}      // q{},
+        $values_ref->{status_resolution} // q{},
+        $rendered,
+    ];
+}
+
+sub emit_structured_rows {
+    my ( $state, $rows_ref ) = @_;
+    return if !$rows_ref || !@{$rows_ref};
+
+    if ( $state->{show_header} ) {
+        print join( $state->{separator}, map { escape_separator( $_, $state->{separator} ) } @STRUCTURED_HEADER_FIELDS ),
+            "\n"
+            or croak $OS_ERROR;
+    }
+
+    for my $row ( @{$rows_ref} ) {
+        print join( $state->{separator}, map { escape_separator( $_ // q{}, $state->{separator} ) } @{$row} ), "\n"
+            or croak $OS_ERROR;
+    }
+
+    return;
+}
+
+sub emit_plain_rows {
+    my ($rows_ref) = @_;
+    for my $line ( @{$rows_ref} ) {
+        print $line, "\n" or croak $OS_ERROR;
+    }
+    return;
+}
 
 sub usage {
     return <<'USAGE';
@@ -481,22 +877,32 @@ USAGE
 sub ensure_commands {
     my @commands = @_;
     for my $cmd (@commands) {
-        my $path = `command -v $cmd 2>/dev/null`;
+        my $fh;
+        open $fh, q{-|}, 'sh', '-c', qq{command -v $cmd 2>/dev/null} or croak $OS_ERROR;
+        my $path = <$fh>;
+        close $fh or croak $OS_ERROR;
+        if ($path) {
+            chomp $path;
+        }
         if ( !$path ) {
-            die "Error: required command '$cmd' not found in PATH\n";
+            croak sprintf $ERROR_GIT_NOT_FOUND, $cmd;
         }
     }
+
+    return;
 }
 
 sub run_git_log {
     my @args = @_;
-    open my $fh, '-|', 'git', @args or die "Error: failed to run git log\n";
+    open my $fh, q{-|}, 'git', @args or croak "Error: failed to run git log\n";
     my @lines;
     while ( my $line = <$fh> ) {
         chomp $line;
-        push @lines, $line if length $line;
+        if ( length $line ) {
+            push @lines, $line;
+        }
     }
-    close $fh;
+    close $fh or croak $OS_ERROR;
     return @lines;
 }
 
@@ -507,7 +913,7 @@ sub extract_bug_ids {
     my %per_commit;
     for my $commit (@commits) {
         my %seen_in_commit;
-        while ( $commit =~ /[Bb]ug[\s_#-]*(\d+)/g ) {
+        while ( $commit =~ /[Bb]ug[\s_#\-]*(\d+)/smxg ) {
             my $id = $1;
             next if $seen_in_commit{$id};
             push @{ $per_commit{$commit} }, $id;
@@ -525,9 +931,9 @@ sub collect_fields_from_template {
     my ($template) = @_;
     my %seen;
     my @fields;
-    while ( $template =~ /\{\{([A-Za-z0-9_]+)\}\}/g ) {
+    while ( $template =~ m{[{][{](\w+)[}][}]}smxg ) {
         my $field = $1;
-        next if $derived_fields{$field};
+        next if $DERIVED_FIELDS{$field};
         next if $seen{$field};
         push @fields, $field;
         $seen{$field} = 1;
@@ -537,60 +943,60 @@ sub collect_fields_from_template {
 
 sub parse_bool {
     my ( $value, $default ) = @_;
-    return $default unless defined $value;
-    return 1 if $value =~ /^(?:1|true|yes|on)$/i;
-    return 0 if $value =~ /^(?:0|false|no|off)$/i;
+    return $default if !defined $value;
+    return 1        if $value =~ /^(?:1|true|yes|on)$/smxi;
+    return 0        if $value =~ /^(?:0|false|no|off)$/smxi;
     return $default;
 }
 
 sub prompt_for_confirmation {
     my ($message) = @_;
     if ( open my $tty, '<', '/dev/tty' ) {
-        print STDERR $message;
+        print {*STDERR} $message or croak $OS_ERROR;
         my $response = <$tty>;
-        close $tty;
-        return defined $response && $response =~ /^[yY]/;
+        close $tty or croak $OS_ERROR;
+        return defined $response && $response =~ /^[yY]/smx;
     }
 
-    if ( -t STDIN ) {
-        print STDERR $message;
-        my $response = <STDIN>;
-        return defined $response && $response =~ /^[yY]/;
+    if ( -t *STDIN ) {
+        print {*STDERR} $message or croak $OS_ERROR;
+        my $response = <>;
+        return defined $response && $response =~ /^[yY]/smx;
     }
 
-    warn "Unable to prompt for confirmation (no TTY/interactive input).\n";
+    carp "Unable to prompt for confirmation (no TTY/interactive input).\n";
     return 0;
 }
 
 sub http_get {
-    my ($url) = @_;
-    my $curl_cmd = [ 'curl', '-sS', '--fail-with-body', '--max-time', '20', '--header', 'Accept: application/json', '--user-agent', 'git-bz-overlay/1.0', $url, ];
-
-    if ( my $curl = `command -v curl 2>/dev/null` ) {
-        chomp $curl;
-        $curl_cmd->[0] = $curl;
-    }
-    else {
-        die "Error: curl is required for Bugzilla requests but was not found in PATH\n";
-    }
+    my ($url)    = @_;
+    my $curl_exe = find_curl_binary();
+    my @curl_cmd = (
+        $curl_exe,            '-sS',      '--fail-with-body',         '--max-time',
+        '20',                 '--header', 'Accept: application/json', '--user-agent',
+        'git-bz-overlay/1.0', $url,
+    );
 
     my $stderr = gensym;
-    my $pid    = open3( my $stdin, my $stdout, $stderr, @$curl_cmd );
-    close $stdin;
-    my $body = do { local $/; <$stdout> // '' };
-    my $err  = do { local $/; <$stderr> // '' };
-    close $stdout;
-    close $stderr;
-    waitpid $pid, 0;
-    my $exit = $? >> 8;
+    my $pid    = open3( my $stdin, my $stdout, $stderr, @curl_cmd );
+    close $stdin or croak $OS_ERROR;
 
-    if ( $exit == 0 ) {
-        return ( 1, $body, 'OK' );
+    my $body = do { local $INPUT_RECORD_SEPARATOR = undef; <$stdout> // q{} };
+    my $err  = do { local $INPUT_RECORD_SEPARATOR = undef; <$stderr> // q{} };
+
+    close $stdout or croak $OS_ERROR;
+    close $stderr or croak $OS_ERROR;
+    my $wait_pid = waitpid $pid, 0;
+    if ( $wait_pid == $WAITPID_ERROR ) {
+        croak "waitpid failed: $OS_ERROR";
     }
+    my $exit = $CHILD_ERROR >> $EXIT_STATUS_SHIFT;
+
+    return ( 1, $body, 'OK' ) if $exit == 0;
 
     my $status_text = 'curl error';
-    if ( $err =~ /HTTP\/(?:\d+\.\d+)\s+(\d+)\s+(.*)/ ) {
-        $status_text = sprintf( 'HTTP %s %s', $1, $2 );
+    if ( $err =~ m{HTTP[/](?:\d+[.]\d+)\s+(\d+)\s+(.*)}smx ) {
+        $status_text = sprintf 'HTTP %s %s', $1, $2;
     }
     elsif ( length $err ) {
         $status_text = $err;
@@ -599,61 +1005,82 @@ sub http_get {
     return ( 0, undef, $status_text );
 }
 
+sub find_curl_binary {
+    open my $fh, q{-|}, 'sh', '-c', 'command -v curl 2>/dev/null' or croak $OS_ERROR;
+    my $curl = <$fh>;
+    close $fh or croak $OS_ERROR;
+    if ($curl) {
+        chomp $curl;
+    }
+    return $curl if $curl;
+    croak $ERROR_CURL_NOT_FOUND;
+}
+
 sub handle_failed_ids {
-    my ( $ids_ref, $reason, $attempts_ref, $failed_ref, $queue_ref, $max_retries ) = @_;
-    return unless $ids_ref && @$ids_ref;
-    for my $id (@$ids_ref) {
+    my ( $ids_ref, $reason, $state ) = @_;
+    return if !$ids_ref || !@{$ids_ref};
+
+    my $attempts_ref      = $state->{attempts};
+    my $failed_ref        = $state->{failed};
+    my $queue_ref         = $state->{queue};
+    my $max_retries_param = $state->{max_retries};
+
+    for my $id ( @{$ids_ref} ) {
         my $attempts = ++$attempts_ref->{$id};
-        if ( $max_retries == 0 || $attempts <= $max_retries ) {
-            push @$queue_ref, $id;
+        if ( $max_retries_param == 0 || $attempts <= $max_retries_param ) {
+            push @{$queue_ref}, $id;
         }
         else {
-            $failed_ref->{$id} = sprintf( '%s after %d attempt%s', $reason, $attempts, $attempts == 1 ? '' : 's' );
+            my $suffix = $attempts == 1 ? q{} : 's';
+            $failed_ref->{$id} = sprintf '%s after %d attempt%s', $reason, $attempts, $suffix;
         }
     }
+
+    return;
 }
 
 sub progress_report {
-    my ( $processed, $total, $cache_hits, $note ) = @_;
-    my $percent = $total ? sprintf( '%.1f%%', ( $processed / $total ) * 100 ) : '100%';
-    my $message = sprintf( '[git-bz-overlay] bugs ready: %d/%d (%s)', $processed, $total, $percent );
-    if ( defined $cache_hits && $cache_hits > 0 ) {
-        $message .= sprintf( ' (cache %d)', $cache_hits );
+    my ( $processed, $total, $cache_hits_param, $note ) = @_;
+    my $percent = $total ? sprintf( '%.1f%%', ( $processed / $total ) * $PERCENTAGE_BASE ) : '100%';
+    my $message = sprintf '[git-bz-overlay] bugs ready: %d/%d (%s)', $processed, $total, $percent;
+    if ( defined $cache_hits_param && $cache_hits_param > 0 ) {
+        $message .= sprintf ' (cache %d)', $cache_hits_param;
     }
     if ( defined $note && length $note ) {
         $message .= " - $note";
     }
-    print STDERR $message, "\n";
+    print {*STDERR} $message, "\n" or croak $OS_ERROR;
+    return;
 }
 
 sub escape_separator {
     my ( $value, $sep ) = @_;
-    return '' unless defined $value;
+    return q{} if !defined $value;
     if ( $sep eq "\t" ) {
-        $value =~ s/\t/\\t/g;
-        $value =~ s/\n/\\n/g;
+        $value =~ s/\t/\\t/smxg;
+        $value =~ s/\n/\\n/smxg;
     }
-    elsif ( $sep eq ',' ) {
-        if ( $value =~ /[",\n]/ ) {
-            $value =~ s/"/""/g;
-            $value = '"' . $value . '"';
+    elsif ( $sep eq q{,} ) {
+        if ( $value =~ /[",\n]/smx ) {
+            $value =~ s/"/""/smxg;
+            $value = qq{"$value"};
         }
     }
-    elsif ( $sep eq '|' ) {
-        $value =~ s/\|/\\|/g;
+    elsif ( $sep eq q{|} ) {
+        $value =~ s{[|]}{\\|}smxg;
     }
     else {
-        my $escaped_sep = quotemeta($sep);
-        $value =~ s/$escaped_sep/\\$sep/g;
+        my $escaped_sep = quotemeta $sep;
+        $value =~ s/$escaped_sep/\\$sep/smxg;
     }
     return $value;
 }
 
 sub stringify_value {
     my ($value) = @_;
-    return '' if !defined $value;
+    return q{} if !defined $value;
     if ( ref $value eq 'ARRAY' ) {
-        return join( ', ', map { stringify_value($_) } @$value );
+        return join ', ', map { stringify_value($_) } @{$value};
     }
     if ( ref $value eq 'HASH' ) {
         return $JSON_UTF8_CANONICAL->encode($value);
@@ -663,54 +1090,104 @@ sub stringify_value {
 
 sub cache_helpers {
     my ( $dir, $ttl, $enabled, $fields_ref ) = @_;
-    if ( !$enabled ) {
-        return ( sub {undef}, sub { } );
-    }
-    eval { make_path($dir) unless -d $dir; };
-    if ($@) {
-        warn "Warning: Unable to create cache directory '$dir'. Disabling cache.\n";
-        return ( sub {undef}, sub { } );
-    }
+    return ( sub {undef}, sub { } ) if !$enabled;
+
+    return _cache_helpers_enabled( $dir, $ttl, $fields_ref );
+}
+
+sub _cache_helpers_enabled {
+    my ( $dir, $ttl, $fields_ref ) = @_;
+    return ( sub {undef}, sub { } ) if !ensure_cache_directory($dir);
+
     my $reader = sub {
         my ($id) = @_;
-        my $path = File::Spec->catfile( $dir, "$id.json" );
-        return undef if !-f $path;
-        if ( $ttl > 0 ) {
-            my $mtime = ( stat($path) )[9];
-            if ( !$mtime || ( time() - $mtime ) > $ttl ) {
-                return undef;
-            }
-        }
-        open my $fh, '<', $path or return undef;
-        local $/;
-        my $content = <$fh>;
-        close $fh;
-        my $data = eval { $JSON_UTF8->decode($content) };
-        return undef if $@ || ref($data) ne 'HASH';
-        for my $field (@$fields_ref) {
-            return undef if !exists $data->{$field};
-        }
-        return $data;
+        return read_cached_bug( $dir, $ttl, $fields_ref, $id );
     };
+
     my $writer = sub {
         my ( $id, $data_ref ) = @_;
-        my $path = File::Spec->catfile( $dir, "$id.json" );
-        open my $fh, '>', $path or return;
-        print {$fh} $JSON_UTF8_CANONICAL->encode($data_ref);
-        close $fh;
+        write_cached_bug( $dir, $id, $data_ref );
+        return;
     };
+
     return ( $reader, $writer );
+}
+
+sub ensure_cache_directory {
+    my ($dir) = @_;
+    return 1 if -d $dir;
+    my $ok = eval { make_path($dir); 1 };
+    if ( !$ok || $EVAL_ERROR ) {
+        carp "Warning: Unable to create cache directory '$dir'. Disabling cache.\n";
+        return 0;
+    }
+    return 1;
+}
+
+sub read_cached_bug {
+    my ( $dir, $ttl, $fields_ref, $id ) = @_;
+    my $path = cache_entry_path( $dir, $id );
+    return if !-f $path;
+    return if cache_entry_expired( $path, $ttl );
+
+    my $data = load_cached_bug($path);
+    return if !$data;
+    return if !has_required_fields( $data, $fields_ref );
+
+    return $data;
+}
+
+sub cache_entry_path {
+    my ( $dir, $id ) = @_;
+    return File::Spec->catfile( $dir, $id . $JSON_FILE_EXTENSION );
+}
+
+sub cache_entry_expired {
+    my ( $path, $ttl ) = @_;
+    return 0 if $ttl <= 0;
+    my $mtime = ( stat $path )[$STAT_MTIME_INDEX];
+    return 1 if !$mtime;
+    return ( time() - $mtime ) > $ttl ? 1 : 0;
+}
+
+sub load_cached_bug {
+    my ($path) = @_;
+    open my $fh, '<', $path or return;
+    local $INPUT_RECORD_SEPARATOR = undef;
+    my $content = <$fh>;
+    close $fh or return;
+
+    my $data = eval { $JSON_UTF8->decode($content) };
+    return if $EVAL_ERROR || ref($data) ne 'HASH';
+    return $data;
+}
+
+sub has_required_fields {
+    my ( $data, $fields_ref ) = @_;
+    for my $field ( @{$fields_ref} ) {
+        return 0 if !exists $data->{$field};
+    }
+    return 1;
+}
+
+sub write_cached_bug {
+    my ( $dir, $id, $data_ref ) = @_;
+    my $path = cache_entry_path( $dir, $id );
+    open my $fh, '>', $path or croak $OS_ERROR;
+    print {$fh} $JSON_UTF8_CANONICAL->encode($data_ref) or croak $OS_ERROR;
+    close $fh                                           or croak $OS_ERROR;
+    return;
 }
 
 sub resolution_suffix {
     my ($resolution) = @_;
-    return '' if !defined $resolution || $resolution eq '' || $resolution eq 'N/A';
-    return '/' . $resolution;
+    return q{} if !defined $resolution || $resolution eq q{} || $resolution eq 'N/A';
+    return q{/} . $resolution;
 }
 
 sub status_resolution {
     my ( $status, $resolution ) = @_;
-    $status = defined $status && $status ne '' ? $status : 'UNKNOWN';
+    $status = defined $status && $status ne q{} ? $status : 'UNKNOWN';
     return $status . resolution_suffix($resolution);
 }
 
@@ -721,15 +1198,17 @@ sub status_block {
 
 sub render_template {
     my ( $template, $values_ref ) = @_;
-    my %values = %$values_ref;
-    $template =~ s/\{\{([A-Za-z0-9_]+)\}\}/defined $values{$1} ? $values{$1} : ''/ge;
+    my %values = %{$values_ref};
+    $template =~ s{[{][{](\w+)[}][}]}{$values{$1} // q{}}smxge;
     return $template;
 }
 
 sub parse_commit_line {
     my ($line) = @_;
-    if ( $line =~ /^(\S+)\s+(.*)$/ ) {
+    if ( $line =~ /^(\S+)\s+(.*)$/smx ) {
         return ( $1, $2 );
     }
     return ( $line, $line );
 }
+
+exit main(@ARGV);

@@ -1,0 +1,63 @@
+# Perl::Critic configuration
+# Based on bscan's configuration with stricter defaults
+# Modified by Cascade (Codeium AI) - https://codeium.com
+
+severity = 1
+theme = pbp || core
+verbose = %f: [%p] %m at line %l, column %c.  %e.  (Severity: %s)
+
+# File extensions to check
+program-extensions = .pl .pm .t
+
+# Modern Perl modules that implicitly include strict/warnings
+[TestingAndDebugging::RequireUseStrict]
+equivalent_modules = Modern::Perl Moo Moose Object::Pad Test::Class::Moose Test2::V0 Test::Most common::sense
+
+[TestingAndDebugging::RequireUseWarnings]
+equivalent_modules = Modern::Perl Moo Moose Object::Pad Test::Class::Moose Test2::V0 Test::Most common::sense
+
+# Gets confused with subroutine signatures - keeping this disabled as it's a legitimate issue
+[-Subroutines::ProhibitSubroutinePrototypes]
+
+# Allow intentional no warnings, but keep strict enforcement
+[-TestingAndDebugging::ProhibitNoWarnings]
+
+# Enforce explicit return undef for clarity
+[Subroutines::ProhibitExplicitReturnUndef]
+
+# Enforce consistent boolean operators
+[ValuesAndExpressions::ProhibitMixedBooleanOperators]
+
+# Enforce Readonly over constant
+[ValuesAndExpressions::ProhibitConstantPragma]
+
+# Enforce single package per file
+[Modules::ProhibitMultiplePackages]
+
+# Require explicit returns
+[Subroutines::RequireFinalReturn]
+
+# Allow Object::Pad and feature imports before package declaration
+[Modules::RequireExplicitPackage]
+allow_import_of = Object::Pad feature Feature::Compat::Class experimental
+
+# Special case for Object::Pad's ADJUST
+[Subroutines::ProhibitBuiltinHomonyms]
+allow = ADJUST
+
+# Exempt modern OO and feature declarations
+[Subroutines::ProhibitCallsToUndeclaredSubs]
+exempt_subs = Moo::has Moose::has Object::Pad::class Object::Pad::field Object::Pad::role Object::Pad::has Object::Pad::param Object::Pad::reader Object::Pad::writer Object::Pad::mutator Object::Pad::accessor experimental::field experimental::class experimental::param feature::field feature::class feature::param Future::AsyncAwait::await Future::AsyncAwait::async feature::try feature::catch Feature::Compat::Try::try Feature::Compat::Try::catch
+
+# Documentation requirements
+[Documentation::RequirePodSections]
+lib_sections    = NAME|SYNOPSIS|DESCRIPTION|AUTHOR|LICENSE AND COPYRIGHT
+
+# Subroutine complexity limits
+[Subroutines::ProhibitExcessComplexity]
+max_mccabe = 10
+
+# I/O safety
+[InputOutput::RequireCheckedSyscalls]
+functions = :builtins
+exclude_functions = print say
