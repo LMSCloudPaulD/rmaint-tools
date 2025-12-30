@@ -211,16 +211,16 @@ lmsd() {
 }
 
 # dtk: Run ktd with a given variant and action, optionally switching worktree if $ASK is set.
-# Usage: dtk <variant> <action>
+# Usage: dtk <variant> <action...>
 # Requires: ktd, docker, gwts (if $ASK is set)
 dtk() {
     local variant
     local action
     local current_dir
     variant=$1
-    action=$2
+    action=("${@:2}")  # Capture all args from $2 onwards as an array
     current_dir=$(pwd)
-    if [[ -z "$action" ]]; then
+    if [[ ${#action[@]} -eq 0 ]]; then
         return 1
     fi
 
@@ -232,13 +232,13 @@ dtk() {
 
     docker ps | grep -q proxy-proxy-1 || return 1
 
-    SYNC_REPO=$(pwd) ktd --proxy --name "$variant" "$action"
+    SYNC_REPO=$(pwd) ktd --proxy --name "$variant" "${action[@]}"
 }
 
 # dtka: Like dtk, but always prompts for worktree selection.
-# Usage: dtka <variant> <action>
+# Usage: dtka <variant> <action...>
 dtka() {
-    ASK=1 dtk "$1" "$2"
+    ASK=1 dtk "$@"
 }
 
 # kdp: Start and follow logs for a named docker environment.
